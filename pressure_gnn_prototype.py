@@ -450,11 +450,11 @@ def eval_epoch(
 # ------------------------------------------------------------
 def main():
     # ==== パラメータ ====
-    data_dir = "./gnn"
+    data_dir = "./gnn"   # pEqn_*.dat があるディレクトリ
     num_epochs = 200
     hidden_dim = 64
     num_layers = 3
-    lambda_pde = 1.0
+    lambda_pde = 1.0     # PDE 物理損失の重み（調整ポイント）
     learning_rate = 1e-3
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -464,8 +464,10 @@ def main():
     dataset = PoissonSystemDataset(data_dir)
     print(f"Found {len(dataset)} pEqn systems.")
 
+    # いったん全部メモリに読み込む（スナップショット数は多くない前提）
     graphs = [dataset[i] for i in range(len(dataset))]
 
+    # train / val に分割（単純に前 80% と後 20%）
     n_total = len(graphs)
     n_train = max(1, int(0.8 * n_total))
     train_graphs = graphs[:n_train]
@@ -480,10 +482,17 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    # ==== 学習ループ ====
-    train_hist = []
-    val_hist   = []
+    # ==== loss 出力ファイルを準備（ヘッダを書いておく）====
+    train_loss_path = "train_loss.dat"
+    val_loss_path   = "val_loss.dat"
 
+    # 毎回上書き開始したいので "w" で開いてヘッダのみ書いて閉じる
+    with open(train_loss_path, "w") as f_tr:
+        f_tr.write("# epoch train_loss train_data_loss train_pde_loss\n")
+    with open(val_loss_path, "w") as f_va:
+        f_va.write("# epoch val_loss val_data_loss val_pde_loss\n")
+
+    # ==== 学習ループ ====
     for epoch in range(1, num_epochs + 1):
         train_loss, train_data, train_pde = train_epoch(
             model, train_graphs, optimizer, device, lambda_pde
@@ -492,9 +501,7 @@ def main():
             model, val_graphs, device, lambda_pde
         )
 
-        train_hist.append((epoch, train_loss, train_data, train_pde))
-        val_hist.append((epoch, val_loss,   val_data,   val_pde))
-
+        # 画面表示
         print(
             f"[Epoch {epoch:03d}] "
             f"train_loss={train_loss:.3e} "
@@ -504,25 +511,28 @@ def main():
             flush=True,
         )
 
-    # ==== loss を .dat に保存 ====
-    with open("train_loss.dat", "w") as f_tr:
-        f_tr.write("# epoch train_loss train_data_loss train_pde_loss\n")
-        for (epoch, tl, td, tp) in train_hist:
-            f_tr.write(f"{epoch} {tl:.8e} {td:.8e} {tp:.8e}\n")
+        # ---- ここで .dat に 1 行ずつ追記 ----
+        with open(train_loss_path, "a") as f_tr:
+            f_tr.write(
+                f"{epoch} {train_loss:.8e} {train_data:.8e} {train_pde:.8e}\n"
+            )
+            f_tr.flush()
 
-    with open("val_loss.dat", "w") as f_va:
-        f_va.write("# epoch val_loss val_data_loss val_pde_loss\n")
-        for (epoch, vl, vd, vp) in val_hist:
-            f_va.write(f"{epoch} {vl:.8e} {vd:.8e} {vp:.8e}\n")
+        with open(val_loss_path, "a") as f_va:
+            f_va.write(
+                f"{epoch} {val_loss:.8e} {val_data:.8e} {val_pde:.8e}\n"
+            )
+            f_va.flush()
+        # --------------------------------------
 
-    print("Saved loss history to train_loss.dat / val_loss.dat")
+    print("Loss history is being recorded in train_loss.dat / val_loss.dat")
 
-    # ==== モデル保存 ====
+    # ==== 学習済みモデルの保存 ====
     out_path = "pressure_gnn_prototype.pt"
     torch.save(model.state_dict(), out_path)
     print(f"Model saved to {out_path}")
 
-    # ==== (オプション) 1つ目のグラフで x_true と比較 ====
+    # ==== (オプション) テストスナップショットで Ax-b と x_true を確認 ====
     if hasattr(graphs[0], "x_true"):
         print("Checking relative error vs OpenFOAM solution (first graph)...")
         data0 = graphs[0].to(device)
