@@ -482,7 +482,9 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    # ==== 学習ループ ====
+# ==== 学習ループ ====
+    history = []  # (epoch, train_loss, train_data, train_pde, val_loss, val_data, val_pde) を保存
+
     for epoch in range(1, num_epochs + 1):
         train_loss, train_data, train_pde = train_epoch(
             model, train_graphs, optimizer, device, lambda_pde
@@ -491,13 +493,29 @@ def main():
             model, val_graphs, device, lambda_pde
         )
 
+        history.append(
+            (epoch, train_loss, train_data, train_pde, val_loss, val_data, val_pde)
+        )
+
         print(
             f"[Epoch {epoch:03d}] "
             f"train_loss={train_loss:.3e} "
             f"(data={train_data:.3e}, pde={train_pde:.3e}) "
             f"val_loss={val_loss:.3e} "
-            f"(data={val_data:.3e}, pde={val_pde:.3e})"
+            f"(data={val_data:.3e}, pde={val_pde:.3e})",
+            flush=True,
         )
+
+    # ==== 学習履歴を CSV に保存 ====
+    import csv
+    with open("training_log.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["epoch", "train_loss", "train_data", "train_pde",
+             "val_loss", "val_data", "val_pde"]
+        )
+        writer.writerows(history)
+    print("Saved training history to training_log.csv")
 
     # ==== 学習済みモデルの保存 ====
     out_path = "pressure_gnn_prototype.pt"
