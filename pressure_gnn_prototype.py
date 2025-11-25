@@ -43,8 +43,10 @@ class TrainingConfig:
     batch_size: int = 1  # グラフのバッチサイズ
 
     # モデル
+    model_type: str = "basic"  # "basic" or "improved"
     hidden_dim: int = 64
     num_layers: int = 3
+    dropout: float = 0.1  # ImprovedPressureGNN用
 
     # 学習
     num_epochs: int = 200
@@ -85,10 +87,14 @@ def parse_args() -> TrainingConfig:
                         help="Batch size for training")
 
     # モデル
+    parser.add_argument("--model-type", type=str, default="basic", choices=["basic", "improved"],
+                        help="Model architecture: basic (simple GCN) or improved (with residuals)")
     parser.add_argument("--hidden-dim", type=int, default=64,
                         help="Hidden dimension size")
     parser.add_argument("--num-layers", type=int, default=3,
                         help="Number of GNN layers")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                        help="Dropout rate for improved model")
 
     # 学習
     parser.add_argument("--num-epochs", type=int, default=200,
@@ -131,8 +137,10 @@ def parse_args() -> TrainingConfig:
     return TrainingConfig(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
+        model_type=args.model_type,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        dropout=args.dropout,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         lambda_pde=args.lambda_pde,
@@ -653,6 +661,82 @@ class PressureGNN(nn.Module):
         return x.view(-1)  # [N]
 
 
+class ImprovedPressureGNN(nn.Module):
+    """
+    改良版 GNN with Residual Connections and Layer Normalization
+
+    特徴:
+    - Residual (skip) connections
+    - Layer Normalization
+    - Dropout for regularization
+    - より深いネットワークに対応
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 64,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        use_layer_norm: bool = True,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.use_layer_norm = use_layer_norm
+
+        # 入力投影層
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+
+        # GNN層
+        self.convs = nn.ModuleList()
+        self.layer_norms = nn.ModuleList() if use_layer_norm else None
+
+        for _ in range(num_layers):
+            self.convs.append(GCNConv(hidden_dim, hidden_dim))
+            if use_layer_norm:
+                self.layer_norms.append(nn.LayerNorm(hidden_dim))
+
+        # 出力層
+        self.output_proj = nn.Linear(hidden_dim, 1)
+
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, data: Data) -> torch.Tensor:
+        x = data.x
+        edge_index = data.edge_index
+
+        # 入力投影
+        x = self.input_proj(x)
+        x = self.activation(x)
+
+        # GNN層 with residual connections
+        for i in range(self.num_layers):
+            # Residual connection
+            residual = x
+
+            # Graph convolution
+            x = self.convs[i](x, edge_index)
+
+            # Layer normalization
+            if self.use_layer_norm:
+                x = self.layer_norms[i](x)
+
+            # Activation
+            x = self.activation(x)
+
+            # Dropout
+            x = self.dropout(x)
+
+            # Residual connection (skip connection)
+            x = x + residual
+
+        # 出力投影
+        x = self.output_proj(x)
+
+        return x.view(-1)  # [N]
+
+
 # ------------------------------------------------------------
 # 4. Ax, 残差 r, L_A, L_div, w_i の計算
 # ------------------------------------------------------------
@@ -1024,7 +1108,24 @@ def main():
 
     # ==== モデル定義 ====
     in_dim = graphs[0].x.shape[1]
-    model = PressureGNN(in_dim=in_dim, hidden_dim=config.hidden_dim, num_layers=config.num_layers)
+
+    if config.model_type == "improved":
+        model = ImprovedPressureGNN(
+            in_dim=in_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            dropout=config.dropout,
+            use_layer_norm=True,
+        )
+        print(f"Using ImprovedPressureGNN (with residuals, layer norm, dropout={config.dropout})")
+    else:
+        model = PressureGNN(
+            in_dim=in_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers
+        )
+        print(f"Using basic PressureGNN")
+
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)

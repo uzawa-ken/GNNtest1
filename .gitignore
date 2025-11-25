@@ -34,9 +34,16 @@ checkpoints/
 # Predictions
 predictions/
 
+# Plots
+plots/
+
 # Loss data files
 train_loss.dat
 val_loss.dat
+
+# Test cache
+.pytest_cache/
+__pycache__/
 
 # Jupyter Notebook
 .ipynb_checkpoints
