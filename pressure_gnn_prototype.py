@@ -15,13 +15,142 @@ total loss = L_data + lambda_pde * L_pde
 
 import os
 import glob
-from typing import List, Tuple
+import argparse
+from typing import List, Tuple, Optional
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 from torch import nn
 from torch_geometric.data import Data, Dataset
 from torch_geometric.nn import GCNConv
+
+# ------------------------------------------------------------
+# 0. 定数とハイパーパラメータ設定
+# ------------------------------------------------------------
+
+# 数値計算用の小さな値（ゼロ除算防止）
+EPSILON_VOLUME = 1e-12
+EPSILON_NORM = 1e-20
+
+
+@dataclass
+class TrainingConfig:
+    """学習設定パラメータ"""
+    # データ
+    data_dir: str = "./gnn"
+
+    # モデル
+    hidden_dim: int = 64
+    num_layers: int = 3
+
+    # 学習
+    num_epochs: int = 200
+    learning_rate: float = 1e-3
+    lambda_pde: float = 1.0
+
+    # Early stopping
+    early_stopping_patience: int = 30
+
+    # スケジューラ
+    scheduler_factor: float = 0.3
+    scheduler_patience: int = 10
+
+    # 再現性
+    seed: int = 42
+
+    # チェックポイント
+    checkpoint_dir: str = "./checkpoints"
+    save_every: int = 50  # N epoch ごとに保存
+
+    # 出力
+    model_output: str = "pressure_gnn_prototype.pt"
+    train_loss_file: str = "train_loss.dat"
+    val_loss_file: str = "val_loss.dat"
+
+
+def parse_args() -> TrainingConfig:
+    """コマンドライン引数をパース"""
+    parser = argparse.ArgumentParser(
+        description="Pressure Poisson GNN Solver",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # データ
+    parser.add_argument("--data-dir", type=str, default="./gnn",
+                        help="Directory containing pEqn_*.dat files")
+
+    # モデル
+    parser.add_argument("--hidden-dim", type=int, default=64,
+                        help="Hidden dimension size")
+    parser.add_argument("--num-layers", type=int, default=3,
+                        help="Number of GNN layers")
+
+    # 学習
+    parser.add_argument("--num-epochs", type=int, default=200,
+                        help="Number of training epochs")
+    parser.add_argument("--lr", "--learning-rate", type=float, default=1e-3,
+                        dest="learning_rate", help="Learning rate")
+    parser.add_argument("--lambda-pde", type=float, default=1.0,
+                        help="Weight for PDE loss term")
+
+    # Early stopping
+    parser.add_argument("--early-stopping-patience", type=int, default=30,
+                        help="Patience for early stopping (0 to disable)")
+
+    # スケジューラ
+    parser.add_argument("--scheduler-factor", type=float, default=0.3,
+                        help="Factor for learning rate reduction")
+    parser.add_argument("--scheduler-patience", type=int, default=10,
+                        help="Patience for learning rate scheduler")
+
+    # 再現性
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+
+    # チェックポイント
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints",
+                        help="Directory to save checkpoints")
+    parser.add_argument("--save-every", type=int, default=50,
+                        help="Save checkpoint every N epochs")
+
+    # 出力
+    parser.add_argument("--model-output", type=str, default="pressure_gnn_prototype.pt",
+                        help="Path to save final model")
+    parser.add_argument("--train-loss-file", type=str, default="train_loss.dat",
+                        help="File to save training loss")
+    parser.add_argument("--val-loss-file", type=str, default="val_loss.dat",
+                        help="File to save validation loss")
+
+    args = parser.parse_args()
+
+    return TrainingConfig(
+        data_dir=args.data_dir,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        lambda_pde=args.lambda_pde,
+        early_stopping_patience=args.early_stopping_patience,
+        scheduler_factor=args.scheduler_factor,
+        scheduler_patience=args.scheduler_patience,
+        seed=args.seed,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every=args.save_every,
+        model_output=args.model_output,
+        train_loss_file=args.train_loss_file,
+        val_loss_file=args.val_loss_file,
+    )
+
+
+def set_random_seed(seed: int) -> None:
+    """再現性のための乱数シード設定"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # CUDNNの決定的動作を有効化（若干遅くなるが再現性が向上）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # ------------------------------------------------------------
 # 1. ファイル読み込み & グラフ構築
@@ -272,7 +401,136 @@ class PoissonSystemDataset(Dataset):
 
 
 # ------------------------------------------------------------
-# 2. GNN モデル定義
+# 2. Early Stopping とチェックポイント管理
+# ------------------------------------------------------------
+
+class EarlyStopping:
+    """Early Stopping クラス"""
+
+    def __init__(self, patience: int = 30, min_delta: float = 0.0, verbose: bool = True):
+        """
+        Args:
+            patience: 改善が見られないエポック数の許容範囲
+            min_delta: 改善とみなす最小の変化量
+            verbose: メッセージを出力するかどうか
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, val_loss: float) -> bool:
+        """
+        検証損失をチェックして early stopping すべきか判定
+
+        Args:
+            val_loss: 検証損失
+
+        Returns:
+            True なら学習を停止すべき
+        """
+        if self.patience <= 0:
+            # patience が 0 以下なら early stopping を無効化
+            return False
+
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            return False
+
+        if val_loss < self.best_loss - self.min_delta:
+            # 改善があった
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.verbose:
+                print(f"  [EarlyStopping] Validation loss improved to {val_loss:.3e}")
+        else:
+            # 改善がなかった
+            self.counter += 1
+            if self.verbose:
+                print(f"  [EarlyStopping] No improvement for {self.counter}/{self.patience} epochs")
+
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f"  [EarlyStopping] Stopping early after {self.patience} epochs without improvement")
+                return True
+
+        return False
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+    checkpoint_path: str,
+) -> None:
+    """
+    学習状態をチェックポイントとして保存
+
+    Args:
+        model: モデル
+        optimizer: オプティマイザ
+        scheduler: 学習率スケジューラ（オプション）
+        epoch: エポック数
+        train_loss: 訓練損失
+        val_loss: 検証損失
+        checkpoint_path: 保存先パス
+    """
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+    }
+
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+
+    torch.save(checkpoint, checkpoint_path)
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+) -> int:
+    """
+    チェックポイントから学習状態を復元
+
+    Args:
+        checkpoint_path: チェックポイントファイルのパス
+        model: モデル
+        optimizer: オプティマイザ（オプション）
+        scheduler: 学習率スケジューラ（オプション）
+
+    Returns:
+        復元されたエポック数
+    """
+    checkpoint = torch.load(checkpoint_path)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    if scheduler is not None and "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    epoch = checkpoint.get("epoch", 0)
+    print(f"Checkpoint loaded from {checkpoint_path} (epoch {epoch})")
+
+    return epoch
+
+
+# ------------------------------------------------------------
+# 3. GNN モデル定義
 # ------------------------------------------------------------
 
 class PressureGNN(nn.Module):
@@ -303,7 +561,7 @@ class PressureGNN(nn.Module):
 
 
 # ------------------------------------------------------------
-# 3. Ax, 残差 r, L_A, L_div, w_i の計算
+# 4. Ax, 残差 r, L_A, L_div, w_i の計算
 # ------------------------------------------------------------
 
 def apply_A_to_x(data: Data, x_vec: torch.Tensor) -> torch.Tensor:
@@ -364,14 +622,14 @@ def compute_losses(
 
     # L_div: div ≒ r / V （Thompson 系の「フラックス発散」的な項）
     volume = data.volume  # ★ 厳密な V_i（ない場合は読み込み時に cellSize^3 で近似）
-    div_hat = r / (volume + 1.0e-12)
+    div_hat = r / (volume + EPSILON_VOLUME)
 
     # w_i: cellSize と aspectRatio から作る mesh-quality weight
     cell_size = data.cell_size
     aspect = data.aspect_ratio
 
-    cs_norm = cell_size / (cell_size.mean() + 1.0e-12)
-    ar_norm = aspect / (aspect.mean() + 1.0e-12)
+    cs_norm = cell_size / (cell_size.mean() + EPSILON_VOLUME)
+    ar_norm = aspect / (aspect.mean() + EPSILON_VOLUME)
     w = 0.5 * (cs_norm + ar_norm)
 
     L_div = torch.mean(w * (div_hat ** 2))
@@ -383,7 +641,7 @@ def compute_losses(
 
 
 # ------------------------------------------------------------
-# 4. 学習ループ
+# 5. 学習ループ
 # ------------------------------------------------------------
 
 def train_epoch(
@@ -447,7 +705,7 @@ def eval_epoch(
 
 
 # ------------------------------------------------------------
-# 5. 診断用ダイアグノスティクス
+# 6. 診断用ダイアグノスティクス
 # ------------------------------------------------------------
 
 @torch.no_grad()
@@ -493,12 +751,12 @@ def evaluate_diagnostics(
         Ax_true = apply_A_to_x(data, x_true)
         r_true = Ax_true - b
 
-        rel_L2 = torch.norm(x_pred - x_true) / (torch.norm(x_true) + 1.0e-20)
-        rel_res_pred = torch.norm(r_pred) / (torch.norm(b) + 1.0e-20)
-        rel_res_true = torch.norm(r_true) / (torch.norm(b) + 1.0e-20)
+        rel_L2 = torch.norm(x_pred - x_true) / (torch.norm(x_true) + EPSILON_NORM)
+        rel_res_pred = torch.norm(r_pred) / (torch.norm(b) + EPSILON_NORM)
+        rel_res_true = torch.norm(r_true) / (torch.norm(b) + EPSILON_NORM)
 
-        div_pred = torch.sqrt(torch.mean((r_pred / (volume + 1.0e-12)) ** 2))
-        div_true = torch.sqrt(torch.mean((r_true / (volume + 1.0e-12)) ** 2))
+        div_pred = torch.sqrt(torch.mean((r_pred / (volume + EPSILON_VOLUME)) ** 2))
+        div_true = torch.sqrt(torch.mean((r_true / (volume + EPSILON_VOLUME)) ** 2))
 
         sum_rel_L2 += rel_L2.item()
         sum_res_pred += rel_res_pred.item()
@@ -517,8 +775,8 @@ def evaluate_diagnostics(
     avg_div_pred = sum_div_pred / n
     avg_div_true = sum_div_true / n
 
-    ratio_res = avg_res_pred / (avg_res_true + 1.0e-20)
-    ratio_div = avg_div_pred / (avg_div_true + 1.0e-20)
+    ratio_res = avg_res_pred / (avg_res_true + EPSILON_NORM)
+    ratio_div = avg_div_pred / (avg_div_true + EPSILON_NORM)
 
     print("\n=== Diagnostics on validation graphs (x_true があるものの平均) ===")
     print(f"  <E_p>                 = {avg_rel_L2:.3e}  # ||x_pred - x_true|| / ||x_true||")
@@ -535,22 +793,28 @@ def evaluate_diagnostics(
 
 
 # ------------------------------------------------------------
-# 6. メイン
+# 7. メイン
 # ------------------------------------------------------------
 def main():
-    # ==== パラメータ ====
-    data_dir = "./gnn"   # pEqn_*.dat があるディレクトリ
-    num_epochs = 200
-    hidden_dim = 64
-    num_layers = 3
-    lambda_pde = 1.0     # PDE 物理損失の重み（調整ポイント）
-    learning_rate = 1e-3
+    # ==== パラメータ読み込み ====
+    config = parse_args()
+    print("=" * 60)
+    print("Training Configuration:")
+    print(f"  Data directory: {config.data_dir}")
+    print(f"  Model: hidden_dim={config.hidden_dim}, num_layers={config.num_layers}")
+    print(f"  Training: epochs={config.num_epochs}, lr={config.learning_rate}, lambda_pde={config.lambda_pde}")
+    print(f"  Early stopping patience: {config.early_stopping_patience}")
+    print(f"  Random seed: {config.seed}")
+    print("=" * 60)
+
+    # ==== 再現性のためのシード設定 ====
+    set_random_seed(config.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     # ==== データセット読み込み ====
-    dataset = PoissonSystemDataset(data_dir)
+    dataset = PoissonSystemDataset(config.data_dir)
     print(f"Found {len(dataset)} pEqn systems.")
 
     # いったん全部メモリに読み込む（スナップショット数は多くない前提）
@@ -559,7 +823,7 @@ def main():
     # ---- ★ train/val 用にランダムシャッフルして 80/20 分割 ----
     n_total = len(graphs)
     idx = np.arange(n_total)
-    rng = np.random.default_rng(seed=42)  # 再現性のため固定シード
+    rng = np.random.default_rng(seed=config.seed)  # 再現性のため固定シード
     rng.shuffle(idx)
     graphs = [graphs[i] for i in idx]
 
@@ -571,30 +835,37 @@ def main():
 
     # ==== モデル定義 ====
     in_dim = graphs[0].x.shape[1]
-    model = PressureGNN(in_dim=in_dim, hidden_dim=hidden_dim, num_layers=num_layers)
+    model = PressureGNN(in_dim=in_dim, hidden_dim=config.hidden_dim, num_layers=config.num_layers)
     model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.3, patience=10, verbose=True
+        optimizer, mode='min', factor=config.scheduler_factor,
+        patience=config.scheduler_patience, verbose=True
     )
 
-    # ==== loss 出力ファイルを準備（ヘッダを書いておく）====
-    train_loss_path = "train_loss.dat"
-    val_loss_path   = "val_loss.dat"
+    # ==== Early Stopping とチェックポイント準備 ====
+    early_stopping = EarlyStopping(patience=config.early_stopping_patience, verbose=True)
 
-    with open(train_loss_path, "w") as f_tr:
+    # チェックポイントディレクトリの作成
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    best_model_path = os.path.join(config.checkpoint_dir, "best_model.pt")
+
+    # ==== loss 出力ファイルを準備（ヘッダを書いておく）====
+    with open(config.train_loss_file, "w") as f_tr:
         f_tr.write("# epoch train_loss train_data_loss train_pde_loss\n")
-    with open(val_loss_path, "w") as f_va:
+    with open(config.val_loss_file, "w") as f_va:
         f_va.write("# epoch val_loss val_data_loss val_pde_loss\n")
 
     # ==== 学習ループ ====
-    for epoch in range(1, num_epochs + 1):
+    best_val_loss = float('inf')
+
+    for epoch in range(1, config.num_epochs + 1):
         train_loss, train_data, train_pde = train_epoch(
-            model, train_graphs, optimizer, device, lambda_pde
+            model, train_graphs, optimizer, device, config.lambda_pde
         )
         val_loss, val_data, val_pde = eval_epoch(
-            model, val_graphs, device, lambda_pde
+            model, val_graphs, device, config.lambda_pde
         )
 
         # 画面表示
@@ -608,27 +879,58 @@ def main():
         )
 
         # loss を .dat に追記
-        with open(train_loss_path, "a") as f_tr:
+        with open(config.train_loss_file, "a") as f_tr:
             f_tr.write(
                 f"{epoch} {train_loss:.8e} {train_data:.8e} {train_pde:.8e}\n"
             )
             f_tr.flush()
 
-        with open(val_loss_path, "a") as f_va:
+        with open(config.val_loss_file, "a") as f_va:
             f_va.write(
                 f"{epoch} {val_loss:.8e} {val_data:.8e} {val_pde:.8e}\n"
             )
             f_va.flush()
 
+        # Best モデルの保存（validation loss が改善した場合）
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(
+                model, optimizer, scheduler, epoch,
+                train_loss, val_loss, best_model_path
+            )
+            print(f"  → Best model saved (val_loss={val_loss:.3e})")
+
+        # 定期的なチェックポイント保存
+        if config.save_every > 0 and epoch % config.save_every == 0:
+            checkpoint_path = os.path.join(
+                config.checkpoint_dir, f"checkpoint_epoch_{epoch:04d}.pt"
+            )
+            save_checkpoint(
+                model, optimizer, scheduler, epoch,
+                train_loss, val_loss, checkpoint_path
+            )
+            print(f"  → Checkpoint saved: {checkpoint_path}")
+
         # scheduler 用に val_loss を監視
         scheduler.step(val_loss)
 
-    print("Loss history is recorded in train_loss.dat / val_loss.dat")
+        # Early stopping チェック
+        if early_stopping(val_loss):
+            print(f"Early stopping triggered at epoch {epoch}")
+            break
 
-    # ==== 学習済みモデルの保存 ====
-    out_path = "pressure_gnn_prototype.pt"
-    torch.save(model.state_dict(), out_path)
-    print(f"Model saved to {out_path}")
+    print(f"Loss history is recorded in {config.train_loss_file} / {config.val_loss_file}")
+
+    # ==== 学習済みモデルの保存（最終エポックのモデル）====
+    torch.save(model.state_dict(), config.model_output)
+    print(f"Final model saved to {config.model_output}")
+    print(f"Best model saved to {best_model_path}")
+
+    # ==== 評価には best model を使用 ====
+    print("\n" + "=" * 60)
+    print("Loading best model for final evaluation...")
+    print("=" * 60)
+    load_checkpoint(best_model_path, model)
 
     # ==== (1) テストスナップショットで x_true との相対誤差を確認 ====
     if hasattr(graphs[0], "x_true"):
@@ -637,7 +939,7 @@ def main():
         with torch.no_grad():
             x_pred = model(data0)
             x_true = data0.x_true.to(device)
-            rel_err = torch.norm(x_pred - x_true) / (torch.norm(x_true) + 1.0e-20)
+            rel_err = torch.norm(x_pred - x_true) / (torch.norm(x_true) + EPSILON_NORM)
             print(f"  ||x_pred - x_true|| / ||x_true|| = {rel_err.item():.3e}")
 
     # ==== (2) Validation 全体で diagnostics を評価 ====
