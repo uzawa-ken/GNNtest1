@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch_geometric.data import Data, Dataset
+from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv
 
 # ------------------------------------------------------------
@@ -39,6 +40,7 @@ class TrainingConfig:
     """学習設定パラメータ"""
     # データ
     data_dir: str = "./gnn"
+    batch_size: int = 1  # グラフのバッチサイズ
 
     # モデル
     hidden_dim: int = 64
@@ -79,6 +81,8 @@ def parse_args() -> TrainingConfig:
     # データ
     parser.add_argument("--data-dir", type=str, default="./gnn",
                         help="Directory containing pEqn_*.dat files")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Batch size for training")
 
     # モデル
     parser.add_argument("--hidden-dim", type=int, default=64,
@@ -126,6 +130,7 @@ def parse_args() -> TrainingConfig:
 
     return TrainingConfig(
         data_dir=args.data_dir,
+        batch_size=args.batch_size,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         num_epochs=args.num_epochs,
@@ -156,6 +161,181 @@ def set_random_seed(seed: int) -> None:
 # 1. ファイル読み込み & グラフ構築
 # ------------------------------------------------------------
 
+def parse_cells_format_a(
+    cell_lines: List[str],
+    nCells: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    フォーマットA（拡張+体積あり）のセル情報を解析
+
+    フォーマット: id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump
+
+    Returns:
+        coords, diag, bvec, volume, cell_size, aspect_ratio
+    """
+    coords = np.zeros((nCells, 3), dtype=np.float64)
+    diag = np.zeros(nCells, dtype=np.float64)
+    bvec = np.zeros(nCells, dtype=np.float64)
+    volume = np.zeros(nCells, dtype=np.float64)
+    cell_size = np.zeros(nCells, dtype=np.float64)
+    aspect_ratio = np.ones(nCells, dtype=np.float64)
+
+    for ln in cell_lines:
+        parts = ln.split()
+        if len(parts) < 13:
+            raise RuntimeError(f"CELLS 行のフォーマットが揃っていません: {ln}")
+
+        cid = int(parts[0])
+        coords[cid] = [float(parts[1]), float(parts[2]), float(parts[3])]
+        diag[cid] = float(parts[4])
+        bvec[cid] = float(parts[5])
+        aspect_ratio[cid] = float(parts[8])
+        volume[cid] = float(parts[10])
+        cell_size[cid] = float(parts[11])
+
+    return coords, diag, bvec, volume, cell_size, aspect_ratio
+
+
+def parse_cells_format_b(
+    cell_lines: List[str],
+    nCells: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    フォーマットB（拡張、体積なし）のセル情報を解析
+
+    フォーマット: id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
+
+    Returns:
+        coords, diag, bvec, volume, cell_size, aspect_ratio
+    """
+    coords = np.zeros((nCells, 3), dtype=np.float64)
+    diag = np.zeros(nCells, dtype=np.float64)
+    bvec = np.zeros(nCells, dtype=np.float64)
+    cell_size = np.zeros(nCells, dtype=np.float64)
+    aspect_ratio = np.ones(nCells, dtype=np.float64)
+
+    for ln in cell_lines:
+        parts = ln.split()
+        if len(parts) < 12:
+            raise RuntimeError(f"CELLS 行のフォーマットが揃っていません: {ln}")
+
+        cid = int(parts[0])
+        coords[cid] = [float(parts[1]), float(parts[2]), float(parts[3])]
+        diag[cid] = float(parts[4])
+        bvec[cid] = float(parts[5])
+        aspect_ratio[cid] = float(parts[8])
+        h_i = float(parts[10])  # cellSize
+        cell_size[cid] = h_i
+
+    # 体積は cellSize^3 で近似
+    volume = cell_size ** 3
+
+    return coords, diag, bvec, volume, cell_size, aspect_ratio
+
+
+def parse_cells_format_c(
+    cell_lines: List[str],
+    nCells: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    フォーマットC（最小版）のセル情報を解析
+
+    フォーマット: id x y z diag b
+
+    Returns:
+        coords, diag, bvec
+    """
+    coords = np.zeros((nCells, 3), dtype=np.float64)
+    diag = np.zeros(nCells, dtype=np.float64)
+    bvec = np.zeros(nCells, dtype=np.float64)
+
+    for ln in cell_lines:
+        parts = ln.split()
+        if len(parts) < 6:
+            raise RuntimeError(f"CELLS 行のフォーマットが想定と違います: {ln}")
+
+        cid = int(parts[0])
+        coords[cid] = [float(parts[1]), float(parts[2]), float(parts[3])]
+        diag[cid] = float(parts[4])
+        bvec[cid] = float(parts[5])
+
+    return coords, diag, bvec
+
+
+def estimate_cell_properties(
+    coords: np.ndarray,
+    neighbors: List[List[int]],
+    nCells: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    近傍情報からcellSizeとaspectRatioを推定
+
+    Args:
+        coords: セル座標 [N, 3]
+        neighbors: 各セルの近傍セルリスト
+        nCells: セル数
+
+    Returns:
+        cell_size, aspect_ratio, volume
+    """
+    cell_size = np.zeros(nCells, dtype=np.float64)
+    aspect_ratio = np.ones(nCells, dtype=np.float64)
+
+    for i in range(nCells):
+        nbrs = neighbors[i]
+        if len(nbrs) == 0:
+            cell_size[i] = 1.0
+            aspect_ratio[i] = 1.0
+            continue
+
+        diffs = coords[nbrs] - coords[i]
+        dists = np.linalg.norm(diffs, axis=1)
+        mean_dist = float(dists.mean())
+        cell_size[i] = mean_dist if mean_dist > 0.0 else 1.0
+
+        if len(dists) > 1:
+            d_min = float(dists.min())
+            d_max = float(dists.max())
+            if d_min <= 0.0:
+                aspect_ratio[i] = 1.0
+            else:
+                aspect_ratio[i] = d_max / d_min
+        else:
+            aspect_ratio[i] = 1.0
+
+    # 体積は cellSize^3 から近似
+    volume = cell_size ** 3
+
+    return cell_size, aspect_ratio, volume
+
+
+def parse_edges(
+    edge_lines: List[str],
+    nFaces: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    エッジ情報を解析
+
+    Returns:
+        lower_ids, upper_ids, lower_vals, upper_vals
+    """
+    lower_ids = np.zeros(nFaces, dtype=np.int64)
+    upper_ids = np.zeros(nFaces, dtype=np.int64)
+    lower_vals = np.zeros(nFaces, dtype=np.float64)
+    upper_vals = np.zeros(nFaces, dtype=np.float64)
+
+    for k, ln in enumerate(edge_lines):
+        parts = ln.split()
+        if len(parts) < 5:
+            raise RuntimeError(f"EDGES 行のフォーマットが想定と違います: {ln}")
+        lower_ids[k] = int(parts[1])
+        upper_ids[k] = int(parts[2])
+        lower_vals[k] = float(parts[3])
+        upper_vals[k] = float(parts[4])
+
+    return lower_ids, upper_ids, lower_vals, upper_vals
+
+
 def load_pEqn_graph(pEqn_path: str) -> Data:
     """
     pEqn_<time>.dat を読み込んで torch_geometric.data.Data を作る。
@@ -173,16 +353,18 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
         id x y z diag b
       -> cellSize, aspectRatio は近傍距離から推定し、V ≒ cellSize^3
     """
+    # ファイル読み込みとセクション分割
     with open(pEqn_path, "r") as f:
         raw_lines = [ln.strip() for ln in f.readlines()]
 
     lines = [ln for ln in raw_lines if ln != ""]
 
-    assert lines[0].startswith("nCells")
+    assert lines[0].startswith("nCells"), f"Invalid format: {pEqn_path}"
     nCells = int(lines[0].split()[1])
-    assert lines[1].startswith("nFaces")
+    assert lines[1].startswith("nFaces"), f"Invalid format: {pEqn_path}"
     nFaces = int(lines[1].split()[1])
 
+    # CELLSとEDGESセクションの位置を特定
     cells_start = None
     edges_start = None
     for i, ln in enumerate(lines):
@@ -200,136 +382,47 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
     if len(cell_lines) != nCells:
         print(f"[WARN] nCells={nCells} だが CELLS 行数={len(cell_lines)}: {pEqn_path}")
 
-    # --- CELLS 部分 ─ ノード情報
-    coords = np.zeros((nCells, 3), dtype=np.float64)
-    diag = np.zeros(nCells, dtype=np.float64)
-    bvec = np.zeros(nCells, dtype=np.float64)
-
-    # ★ mesh-quality 用
-    volume = np.zeros(nCells, dtype=np.float64)        # 厳密体積 or 近似
-    cell_size = np.zeros(nCells, dtype=np.float64)     # 代表長さ
-    aspect_ratio = np.ones(nCells, dtype=np.float64)   # アスペクト比
-
-    # 先頭行からフォーマットを推定
+    # --- CELLS 部分の解析 ---
+    # 先頭行からフォーマットを判定
     first_parts = cell_lines[0].split()
     n_fields = len(first_parts)
 
-    # ------------------------------------------------------------------
-    # パターン [A]: 拡張 + 体積あり
-    #   id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump
-    # ------------------------------------------------------------------
     if n_fields >= 13:
-        for ln in cell_lines:
-            parts = ln.split()
-            if len(parts) < 13:
-                raise RuntimeError(f"CELLS 行のフォーマットが揃っていません: {ln}")
-            cid = int(parts[0])
-            x, y, z = map(float, parts[1:4])
-            d = float(parts[4])
-            b = float(parts[5])
-
-            coords[cid] = [x, y, z]
-            diag[cid] = d
-            bvec[cid] = b
-
-            aspect_ratio[cid] = float(parts[8])
-            V_i = float(parts[10])
-            volume[cid] = V_i
-            cell_size[cid] = float(parts[11])
-
-    # ------------------------------------------------------------------
-    # パターン [B]: 拡張 (体積なし)
-    #   id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
-    # ------------------------------------------------------------------
+        # フォーマット A: 拡張 + 体積あり
+        coords, diag, bvec, volume, cell_size, aspect_ratio = parse_cells_format_a(
+            cell_lines, nCells
+        )
     elif n_fields == 12:
-        for ln in cell_lines:
-            parts = ln.split()
-            if len(parts) < 12:
-                raise RuntimeError(f"CELLS 行のフォーマットが揃っていません: {ln}")
-            cid = int(parts[0])
-            x, y, z = map(float, parts[1:4])
-            d = float(parts[4])
-            b = float(parts[5])
-
-            coords[cid] = [x, y, z]
-            diag[cid] = d
-            bvec[cid] = b
-
-            aspect_ratio[cid] = float(parts[8])
-            h_i = float(parts[10])     # cellSize
-            cell_size[cid] = h_i
-            volume[cid] = h_i**3       # 近似 V ≒ h^3
-
-    # ------------------------------------------------------------------
-    # パターン [C]: 最小版 (id x y z diag b)
-    # ------------------------------------------------------------------
+        # フォーマット B: 拡張（体積なし）
+        coords, diag, bvec, volume, cell_size, aspect_ratio = parse_cells_format_b(
+            cell_lines, nCells
+        )
     else:
-        for ln in cell_lines:
-            parts = ln.split()
-            if len(parts) < 6:
-                raise RuntimeError(f"CELLS 行のフォーマットが想定と違います: {ln}")
-            cid = int(parts[0])
-            x, y, z = map(float, parts[1:4])
-            d = float(parts[4])
-            b = float(parts[5])
-            coords[cid] = [x, y, z]
-            diag[cid] = d
-            bvec[cid] = b
-        # cellSize/aspectRatio は後で neighbors から推定し、V ≒ h^3 にする
+        # フォーマット C: 最小版
+        coords, diag, bvec = parse_cells_format_c(cell_lines, nCells)
+        # cellSize/aspectRatio/volumeは後で推定
 
-    # --- EDGES 部分 ─ A の lower/upper と隣接情報
-    lower_ids = np.zeros(nFaces, dtype=np.int64)
-    upper_ids = np.zeros(nFaces, dtype=np.int64)
-    lower_vals = np.zeros(nFaces, dtype=np.float64)
-    upper_vals = np.zeros(nFaces, dtype=np.float64)
+    # --- EDGES 部分の解析 ---
+    lower_ids, upper_ids, lower_vals, upper_vals = parse_edges(edge_lines, nFaces)
 
-    for k, ln in enumerate(edge_lines):
-        parts = ln.split()
-        if len(parts) < 5:
-            raise RuntimeError(f"EDGES 行のフォーマットが想定と違います: {ln}")
-        lower_ids[k] = int(parts[1])
-        upper_ids[k] = int(parts[2])
-        lower_vals[k] = float(parts[3])
-        upper_vals[k] = float(parts[4])
-
-    # --- GNN用 edge_index (無向グラフ)
-    ei_src = np.concatenate([lower_ids, upper_ids])
-    ei_dst = np.concatenate([upper_ids, lower_ids])
-    edge_index = torch.tensor(
-        np.vstack([ei_src, ei_dst]), dtype=torch.long
-    )  # [2, 2*nFaces]
-
-    # --- neighbors 枠は、[C] の場合の cellSize/aspectRatio 推定に使う
+    # --- 近傍リストの構築（フォーマットCの場合に必要）---
     neighbors: List[List[int]] = [[] for _ in range(nCells)]
     for li, ui in zip(lower_ids, upper_ids):
         neighbors[li].append(ui)
         neighbors[ui].append(li)
 
-    # パターン [C]（cellSize/aspectRatio 未設定）の場合だけ推定する
+    # フォーマットC の場合、近傍から cellSize/aspectRatio/volume を推定
     if n_fields < 12:
-        for i in range(nCells):
-            nbrs = neighbors[i]
-            if len(nbrs) == 0:
-                cell_size[i] = 1.0
-                aspect_ratio[i] = 1.0
-                continue
-            diffs = coords[nbrs] - coords[i]
-            dists = np.linalg.norm(diffs, axis=1)
-            mean_dist = float(dists.mean())
-            cell_size[i] = mean_dist if mean_dist > 0.0 else 1.0
+        cell_size, aspect_ratio, volume = estimate_cell_properties(
+            coords, neighbors, nCells
+        )
 
-            if len(dists) > 1:
-                d_min = float(dists.min())
-                d_max = float(dists.max())
-                if d_min <= 0.0:
-                    aspect_ratio[i] = 1.0
-                else:
-                    aspect_ratio[i] = d_max / d_min
-            else:
-                aspect_ratio[i] = 1.0
-
-        # 体積は cellSize^3 から近似
-        volume = cell_size**3
+    # --- GNN用 edge_index (無向グラフ) ---
+    ei_src = np.concatenate([lower_ids, upper_ids])
+    ei_dst = np.concatenate([upper_ids, lower_ids])
+    edge_index = torch.tensor(
+        np.vstack([ei_src, ei_dst]), dtype=torch.long
+    )  # [2, 2*nFaces]
 
     # --- ノード特徴量 x_feat = [b, diag, cellSize, aspectRatio, x, y, z]
     b_t = torch.from_numpy(bvec).float().view(-1, 1)
@@ -646,24 +739,37 @@ def compute_losses(
 
 def train_epoch(
     model: nn.Module,
-    graphs: List[Data],
+    dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_pde: float,
 ) -> Tuple[float, float, float]:
+    """
+    1エポック分の学習を実行
+
+    Args:
+        model: GNNモデル
+        dataloader: データローダー（バッチ処理）
+        optimizer: オプティマイザ
+        device: デバイス（CPU/GPU）
+        lambda_pde: PDE損失の重み
+
+    Returns:
+        (平均total_loss, 平均data_loss, 平均pde_loss)
+    """
     model.train()
     total_loss = 0.0
     total_data = 0.0
     total_pde = 0.0
     n = 0
 
-    for data in graphs:
-        data = data.to(device)
+    for batch in dataloader:
+        batch = batch.to(device)
         optimizer.zero_grad()
 
-        x_pred = model(data)
+        x_pred = model(batch)
         loss, data_loss, pde_loss = compute_losses(
-            data, x_pred, lambda_pde=lambda_pde
+            batch, x_pred, lambda_pde=lambda_pde
         )
 
         loss.backward()
@@ -680,21 +786,33 @@ def train_epoch(
 @torch.no_grad()
 def eval_epoch(
     model: nn.Module,
-    graphs: List[Data],
+    dataloader: DataLoader,
     device: torch.device,
     lambda_pde: float,
 ) -> Tuple[float, float, float]:
+    """
+    1エポック分の評価を実行
+
+    Args:
+        model: GNNモデル
+        dataloader: データローダー（バッチ処理）
+        device: デバイス（CPU/GPU）
+        lambda_pde: PDE損失の重み
+
+    Returns:
+        (平均total_loss, 平均data_loss, 平均pde_loss)
+    """
     model.eval()
     total_loss = 0.0
     total_data = 0.0
     total_pde = 0.0
     n = 0
 
-    for data in graphs:
-        data = data.to(device)
-        x_pred = model(data)
+    for batch in dataloader:
+        batch = batch.to(device)
+        x_pred = model(batch)
         loss, data_loss, pde_loss = compute_losses(
-            data, x_pred, lambda_pde=lambda_pde
+            batch, x_pred, lambda_pde=lambda_pde
         )
         total_loss += loss.item()
         total_data += data_loss.item()
@@ -705,7 +823,63 @@ def eval_epoch(
 
 
 # ------------------------------------------------------------
-# 6. 診断用ダイアグノスティクス
+# 6. 予測結果の保存
+# ------------------------------------------------------------
+
+def save_predictions(
+    model: nn.Module,
+    graphs: List[Data],
+    device: torch.device,
+    output_dir: str = "./predictions",
+) -> None:
+    """
+    モデルの予測結果を保存
+
+    Args:
+        model: 学習済みモデル
+        graphs: データのリスト
+        device: デバイス
+        output_dir: 出力ディレクトリ
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
+
+    print(f"\nSaving predictions to {output_dir}...")
+
+    with torch.no_grad():
+        for idx, data in enumerate(graphs):
+            data = data.to(device)
+            x_pred = model(data).cpu().numpy()
+
+            # ファイル名を生成（グラフのインデックスベース）
+            output_path = os.path.join(output_dir, f"prediction_{idx:04d}.dat")
+
+            # 予測結果を保存
+            with open(output_path, "w") as f:
+                f.write(f"# Prediction for graph {idx}\n")
+                f.write(f"# nCells {len(x_pred)}\n")
+                for cell_id, val in enumerate(x_pred):
+                    f.write(f"{cell_id} {val:.12e}\n")
+
+            # x_true がある場合は誤差も計算して保存
+            if hasattr(data, "x_true"):
+                x_true = data.x_true.cpu().numpy()
+                error = x_pred - x_true
+                error_path = os.path.join(output_dir, f"error_{idx:04d}.dat")
+
+                with open(error_path, "w") as f:
+                    f.write(f"# Prediction error for graph {idx}\n")
+                    f.write(f"# nCells {len(error)}\n")
+                    f.write(f"# L2_norm {np.linalg.norm(error):.12e}\n")
+                    f.write(f"# Relative_L2 {np.linalg.norm(error) / (np.linalg.norm(x_true) + EPSILON_NORM):.12e}\n")
+                    for cell_id, (err, pred, true) in enumerate(zip(error, x_pred, x_true)):
+                        f.write(f"{cell_id} {err:.12e} {pred:.12e} {true:.12e}\n")
+
+    print(f"Saved {len(graphs)} prediction files to {output_dir}")
+
+
+# ------------------------------------------------------------
+# 7. 診断用ダイアグノスティクス
 # ------------------------------------------------------------
 
 @torch.no_grad()
@@ -793,7 +967,7 @@ def evaluate_diagnostics(
 
 
 # ------------------------------------------------------------
-# 7. メイン
+# 8. メイン
 # ------------------------------------------------------------
 def main():
     # ==== パラメータ読み込み ====
@@ -833,6 +1007,21 @@ def main():
 
     print(f"Train graphs: {len(train_graphs)}, Val graphs: {len(val_graphs)}")
 
+    # ==== DataLoader の作成 ====
+    train_loader = DataLoader(
+        train_graphs,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=0,  # PyTorch Geometric ではマルチプロセスに注意
+    )
+    val_loader = DataLoader(
+        val_graphs,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    print(f"Batch size: {config.batch_size}")
+
     # ==== モデル定義 ====
     in_dim = graphs[0].x.shape[1]
     model = PressureGNN(in_dim=in_dim, hidden_dim=config.hidden_dim, num_layers=config.num_layers)
@@ -862,10 +1051,10 @@ def main():
 
     for epoch in range(1, config.num_epochs + 1):
         train_loss, train_data, train_pde = train_epoch(
-            model, train_graphs, optimizer, device, config.lambda_pde
+            model, train_loader, optimizer, device, config.lambda_pde
         )
         val_loss, val_data, val_pde = eval_epoch(
-            model, val_graphs, device, config.lambda_pde
+            model, val_loader, device, config.lambda_pde
         )
 
         # 画面表示
@@ -944,6 +1133,9 @@ def main():
 
     # ==== (2) Validation 全体で diagnostics を評価 ====
     evaluate_diagnostics(model, val_graphs, device)
+
+    # ==== (3) 予測結果を保存 ====
+    save_predictions(model, val_graphs, device, output_dir="./predictions")
 
 
 if __name__ == "__main__":

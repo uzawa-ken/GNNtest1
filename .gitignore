@@ -31,6 +31,9 @@ wheels/
 # Checkpoints
 checkpoints/
 
+# Predictions
+predictions/
+
 # Loss data files
 train_loss.dat
 val_loss.dat
