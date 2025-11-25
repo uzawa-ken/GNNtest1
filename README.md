@@ -71,6 +71,9 @@ python pressure_gnn_prototype.py --batch-size 4 --hidden-dim 128
 ### 使用例
 
 ```bash
+# 基本的な学習（リアルタイムプロット有効）
+python pressure_gnn_prototype.py --realtime-plot
+
 # 改良版モデルで深いネットワークを学習
 python pressure_gnn_prototype.py \
   --model-type improved \
@@ -78,12 +81,19 @@ python pressure_gnn_prototype.py \
   --num-layers 5 \
   --dropout 0.2 \
   --num-epochs 500 \
-  --early-stopping-patience 50
+  --early-stopping-patience 50 \
+  --realtime-plot
+
+# TensorBoardを使用した高度なログ記録
+python pressure_gnn_prototype.py \
+  --use-tensorboard
 
 # 物理損失の重みを調整
 python pressure_gnn_prototype.py \
   --lambda-pde 2.0 \
-  --lr 0.0005
+  --lr 0.0005 \
+  --realtime-plot \
+  --plot-interval 5
 
 # ヘルプを表示
 python pressure_gnn_prototype.py --help
@@ -91,7 +101,51 @@ python pressure_gnn_prototype.py --help
 
 ## 可視化
 
-学習後、可視化スクリプトで結果を確認できます：
+### リアルタイム可視化（学習中）
+
+学習の進行状況をリアルタイムで監視できます：
+
+#### matplotlibによる可視化
+
+```bash
+# リアルタイムプロットを有効化
+python pressure_gnn_prototype.py --realtime-plot
+
+# プロット更新間隔を調整（5エポックごと）
+python pressure_gnn_prototype.py --realtime-plot --plot-interval 5
+```
+
+**表示される3つのグラフ**：
+1. **Total Loss**: 訓練損失と検証損失の推移
+2. **Data Loss**: データ損失（MSE）の推移
+3. **PDE Loss**: PDE残差損失の推移
+
+**注意事項**：
+- GUIバックエンド（TkAgg）が必要です
+- SSHやヘッドレス環境では動作しません（代わりにTensorBoardを使用）
+- 学習中にウィンドウを閉じないでください
+
+#### TensorBoardによる可視化
+
+```bash
+# TensorBoardログを有効化
+python pressure_gnn_prototype.py --use-tensorboard
+
+# 別のターミナルでTensorBoardを起動
+tensorboard --logdir=runs
+
+# ブラウザで http://localhost:6006 を開く
+```
+
+**TensorBoardの利点**：
+- ブラウザベースで動作（SSH経由でも使用可能）
+- より詳細なメトリクスとヒストグラム
+- 複数の実験を比較可能
+- スムージング機能付き
+
+### 学習後の可視化
+
+学習完了後、可視化スクリプトで詳細な分析ができます：
 
 ```bash
 # 学習曲線と予測結果をプロット
@@ -105,7 +159,7 @@ python visualize_training.py \
   --output-dir ./plots
 ```
 
-生成されるプロット：
+**生成されるプロット**：
 - `total_loss.png`: 訓練・検証損失の推移
 - `data_pde_loss.png`: データ損失とPDE損失の分離プロット
 - `prediction_comparison_XXXX.png`: 予測 vs 真値の散布図と誤差分布

@@ -72,6 +72,11 @@ class TrainingConfig:
     train_loss_file: str = "train_loss.dat"
     val_loss_file: str = "val_loss.dat"
 
+    # リアルタイム可視化
+    realtime_plot: bool = False  # リアルタイムプロットを有効化
+    plot_interval: int = 1       # N epochごとにプロットを更新
+    use_tensorboard: bool = False  # TensorBoardを使用
+
 
 def parse_args() -> TrainingConfig:
     """コマンドライン引数をパース"""
@@ -132,6 +137,14 @@ def parse_args() -> TrainingConfig:
     parser.add_argument("--val-loss-file", type=str, default="val_loss.dat",
                         help="File to save validation loss")
 
+    # リアルタイム可視化
+    parser.add_argument("--realtime-plot", action="store_true",
+                        help="Enable real-time plotting of losses")
+    parser.add_argument("--plot-interval", type=int, default=1,
+                        help="Update plot every N epochs")
+    parser.add_argument("--use-tensorboard", action="store_true",
+                        help="Use TensorBoard for logging")
+
     args = parser.parse_args()
 
     return TrainingConfig(
@@ -153,6 +166,9 @@ def parse_args() -> TrainingConfig:
         model_output=args.model_output,
         train_loss_file=args.train_loss_file,
         val_loss_file=args.val_loss_file,
+        realtime_plot=args.realtime_plot,
+        plot_interval=args.plot_interval,
+        use_tensorboard=args.use_tensorboard,
     )
 
 
@@ -628,6 +644,103 @@ def load_checkpoint(
     print(f"Checkpoint loaded from {checkpoint_path} (epoch {epoch})")
 
     return epoch
+
+
+class RealtimePlotter:
+    """リアルタイムで学習曲線をプロットするクラス"""
+
+    def __init__(self, plot_interval: int = 1):
+        """
+        Args:
+            plot_interval: N epochごとにプロットを更新
+        """
+        import matplotlib
+        matplotlib.use('TkAgg')  # インタラクティブバックエンドを使用
+        import matplotlib.pyplot as plt
+
+        self.plt = plt
+        self.plot_interval = plot_interval
+
+        # データ保存用
+        self.epochs = []
+        self.train_losses = []
+        self.val_losses = []
+        self.train_data_losses = []
+        self.val_data_losses = []
+        self.train_pde_losses = []
+        self.val_pde_losses = []
+
+        # プロットの初期化
+        self.fig, self.axes = self.plt.subplots(1, 3, figsize=(18, 5))
+        self.plt.ion()  # インタラクティブモードをON
+        self.fig.show()
+
+    def update(
+        self,
+        epoch: int,
+        train_loss: float,
+        train_data: float,
+        train_pde: float,
+        val_loss: float,
+        val_data: float,
+        val_pde: float,
+    ):
+        """プロットを更新"""
+        # データを追加
+        self.epochs.append(epoch)
+        self.train_losses.append(train_loss)
+        self.val_losses.append(val_loss)
+        self.train_data_losses.append(train_data)
+        self.val_data_losses.append(val_data)
+        self.train_pde_losses.append(train_pde)
+        self.val_pde_losses.append(val_pde)
+
+        # plot_interval ごとにのみプロットを更新
+        if epoch % self.plot_interval != 0:
+            return
+
+        # 既存のプロットをクリア
+        for ax in self.axes:
+            ax.clear()
+
+        # 1. Total Loss
+        self.axes[0].plot(self.epochs, self.train_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
+        self.axes[0].plot(self.epochs, self.val_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
+        self.axes[0].set_xlabel('Epoch', fontsize=11)
+        self.axes[0].set_ylabel('Total Loss', fontsize=11)
+        self.axes[0].set_title('Total Loss', fontsize=12, fontweight='bold')
+        self.axes[0].legend(fontsize=10)
+        self.axes[0].grid(True, alpha=0.3)
+        self.axes[0].set_yscale('log')
+
+        # 2. Data Loss
+        self.axes[1].plot(self.epochs, self.train_data_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
+        self.axes[1].plot(self.epochs, self.val_data_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
+        self.axes[1].set_xlabel('Epoch', fontsize=11)
+        self.axes[1].set_ylabel('Data Loss', fontsize=11)
+        self.axes[1].set_title('Data Loss (MSE)', fontsize=12, fontweight='bold')
+        self.axes[1].legend(fontsize=10)
+        self.axes[1].grid(True, alpha=0.3)
+        self.axes[1].set_yscale('log')
+
+        # 3. PDE Loss
+        self.axes[2].plot(self.epochs, self.train_pde_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
+        self.axes[2].plot(self.epochs, self.val_pde_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
+        self.axes[2].set_xlabel('Epoch', fontsize=11)
+        self.axes[2].set_ylabel('PDE Loss', fontsize=11)
+        self.axes[2].set_title('PDE Loss (Physics)', fontsize=12, fontweight='bold')
+        self.axes[2].legend(fontsize=10)
+        self.axes[2].grid(True, alpha=0.3)
+        self.axes[2].set_yscale('log')
+
+        self.plt.tight_layout()
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    def close(self):
+        """プロットウィンドウを閉じる"""
+        self.plt.ioff()
+        self.plt.close(self.fig)
 
 
 # ------------------------------------------------------------
@@ -1147,6 +1260,28 @@ def main():
     with open(config.val_loss_file, "w") as f_va:
         f_va.write("# epoch val_loss val_data_loss val_pde_loss\n")
 
+    # ==== リアルタイムプロッター ====
+    plotter = None
+    if config.realtime_plot:
+        try:
+            plotter = RealtimePlotter(plot_interval=config.plot_interval)
+            print(f"Real-time plotting enabled (updating every {config.plot_interval} epochs)")
+        except Exception as e:
+            print(f"Warning: Could not initialize real-time plotter: {e}")
+            print("Continuing without real-time plotting...")
+            plotter = None
+
+    # ==== TensorBoard ====
+    writer = None
+    if config.use_tensorboard:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(log_dir=os.path.join(config.checkpoint_dir, "tensorboard"))
+            print(f"TensorBoard logging enabled. Run: tensorboard --logdir={config.checkpoint_dir}/tensorboard")
+        except ImportError:
+            print("Warning: TensorBoard not available. Install with: pip install tensorboard")
+            writer = None
+
     # ==== 学習ループ ====
     best_val_loss = float('inf')
 
@@ -1181,6 +1316,21 @@ def main():
             )
             f_va.flush()
 
+        # リアルタイムプロットの更新
+        if plotter is not None:
+            plotter.update(epoch, train_loss, train_data, train_pde,
+                          val_loss, val_data, val_pde)
+
+        # TensorBoardへのログ記録
+        if writer is not None:
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('Loss/train_data', train_data, epoch)
+            writer.add_scalar('Loss/val_data', val_data, epoch)
+            writer.add_scalar('Loss/train_pde', train_pde, epoch)
+            writer.add_scalar('Loss/val_pde', val_pde, epoch)
+            writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
+
         # Best モデルの保存（validation loss が改善した場合）
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -1210,6 +1360,12 @@ def main():
             break
 
     print(f"Loss history is recorded in {config.train_loss_file} / {config.val_loss_file}")
+
+    # ==== クリーンアップ ====
+    if plotter is not None:
+        plotter.close()
+    if writer is not None:
+        writer.close()
 
     # ==== 学習済みモデルの保存（最終エポックのモデル）====
     torch.save(model.state_dict(), config.model_output)
