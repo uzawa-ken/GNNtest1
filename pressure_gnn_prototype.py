@@ -86,7 +86,8 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
     n_fields = len(first_parts)
 
     # ------------------------------------------------------------------
-    # パターン [A]: 拡張 + 体積あり (id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump)
+    # パターン [A]: 拡張 + 体積あり
+    #   id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump
     # ------------------------------------------------------------------
     if n_fields >= 13:
         for ln in cell_lines:
@@ -102,14 +103,14 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
             diag[cid] = d
             bvec[cid] = b
 
-            # parts[6]..[9] は skew, nonOrtho, aspect, diagContrast（必要なら後で使える）
             aspect_ratio[cid] = float(parts[8])
             V_i = float(parts[10])
             volume[cid] = V_i
             cell_size[cid] = float(parts[11])
 
     # ------------------------------------------------------------------
-    # パターン [B]: 拡張 (体積なし) (id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump)
+    # パターン [B]: 拡張 (体積なし)
+    #   id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
     # ------------------------------------------------------------------
     elif n_fields == 12:
         for ln in cell_lines:
@@ -131,7 +132,7 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
             volume[cid] = h_i**3       # 近似 V ≒ h^3
 
     # ------------------------------------------------------------------
-    # パターン [C]: 最小版 (id x y z diag b) → cellSize, aspectRatio は近傍から推定
+    # パターン [C]: 最小版 (id x y z diag b)
     # ------------------------------------------------------------------
     else:
         for ln in cell_lines:
@@ -446,7 +447,95 @@ def eval_epoch(
 
 
 # ------------------------------------------------------------
-# 5. メイン
+# 5. 診断用ダイアグノスティクス
+# ------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_diagnostics(
+    model: nn.Module,
+    graphs: List[Data],
+    device: torch.device,
+) -> None:
+    """
+    Validation グラフに対して:
+
+      E_p      = ||x_pred - x_true|| / ||x_true||
+      R_pred   = ||A x_pred - b|| / ||b||
+      R_true   = ||A x_true - b|| / ||b||
+      div_pred = sqrt(mean( ( (A x_pred - b)/V )^2 ))
+      div_true = 同様
+
+    を x_true を持つグラフについて平均して表示する。
+    """
+    model.eval()
+
+    sum_rel_L2 = 0.0
+    sum_res_pred = 0.0
+    sum_res_true = 0.0
+    sum_div_pred = 0.0
+    sum_div_true = 0.0
+    n = 0
+
+    for data in graphs:
+        if not hasattr(data, "x_true"):
+            continue  # x_true がないグラフはスキップ
+
+        data = data.to(device)
+        x_true = data.x_true.to(device)
+        x_pred = model(data)
+
+        b = data.b
+        volume = data.volume
+
+        Ax_pred = apply_A_to_x(data, x_pred)
+        r_pred = Ax_pred - b
+
+        Ax_true = apply_A_to_x(data, x_true)
+        r_true = Ax_true - b
+
+        rel_L2 = torch.norm(x_pred - x_true) / (torch.norm(x_true) + 1.0e-20)
+        rel_res_pred = torch.norm(r_pred) / (torch.norm(b) + 1.0e-20)
+        rel_res_true = torch.norm(r_true) / (torch.norm(b) + 1.0e-20)
+
+        div_pred = torch.sqrt(torch.mean((r_pred / (volume + 1.0e-12)) ** 2))
+        div_true = torch.sqrt(torch.mean((r_true / (volume + 1.0e-12)) ** 2))
+
+        sum_rel_L2 += rel_L2.item()
+        sum_res_pred += rel_res_pred.item()
+        sum_res_true += rel_res_true.item()
+        sum_div_pred += div_pred.item()
+        sum_div_true += div_true.item()
+        n += 1
+
+    if n == 0:
+        print("Diagnostics: x_true を持つ validation グラフが無いためスキップしました。")
+        return
+
+    avg_rel_L2 = sum_rel_L2 / n
+    avg_res_pred = sum_res_pred / n
+    avg_res_true = sum_res_true / n
+    avg_div_pred = sum_div_pred / n
+    avg_div_true = sum_div_true / n
+
+    ratio_res = avg_res_pred / (avg_res_true + 1.0e-20)
+    ratio_div = avg_div_pred / (avg_div_true + 1.0e-20)
+
+    print("\n=== Diagnostics on validation graphs (x_true があるものの平均) ===")
+    print(f"  <E_p>                 = {avg_rel_L2:.3e}  # ||x_pred - x_true|| / ||x_true||")
+    print(f"  <R_pred>              = {avg_res_pred:.3e}  # ||A x_pred - b|| / ||b||")
+    print(f"  <R_true>              = {avg_res_true:.3e}  # ||A x_true - b|| / ||b||")
+    print(f"  <div_pred>_rms        = {avg_div_pred:.3e}  # rms( (A x_pred - b)/V )")
+    print(f"  <div_true>_rms        = {avg_div_true:.3e}  # rms( (A x_true - b)/V )")
+    print(f"  ratio R_pred / R_true = {ratio_res:.3e}")
+    print(f"  ratio div_pred/div_true = {ratio_div:.3e}")
+    print("  ※ (A)/(B)/(C) の目安:")
+    print("    (A) preconditioner 的:   E_p ~ 1e-1, R_pred ~ 1e-2〜1e-1, div_ratio ~ O(1〜10)")
+    print("    (B) pEqn 短縮レベル:     E_p ~ 1e-2, R_pred ~ 1e-3,      div_ratio ~ O(1〜2)")
+    print("    (C) 完全置き換えレベル: それよりさらに良いレンジ")
+
+
+# ------------------------------------------------------------
+# 6. メイン
 # ------------------------------------------------------------
 def main():
     # ==== パラメータ ====
@@ -467,8 +556,13 @@ def main():
     # いったん全部メモリに読み込む（スナップショット数は多くない前提）
     graphs = [dataset[i] for i in range(len(dataset))]
 
-    # train / val に分割（単純に前 80% と後 20%）
+    # ---- ★ train/val 用にランダムシャッフルして 80/20 分割 ----
     n_total = len(graphs)
+    idx = np.arange(n_total)
+    rng = np.random.default_rng(seed=42)  # 再現性のため固定シード
+    rng.shuffle(idx)
+    graphs = [graphs[i] for i in idx]
+
     n_train = max(1, int(0.8 * n_total))
     train_graphs = graphs[:n_train]
     val_graphs = graphs[n_train:] if n_total > 1 else graphs
@@ -481,12 +575,14 @@ def main():
     model.to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.3, patience=10, verbose=True
+    )
 
     # ==== loss 出力ファイルを準備（ヘッダを書いておく）====
     train_loss_path = "train_loss.dat"
     val_loss_path   = "val_loss.dat"
 
-    # 毎回上書き開始したいので "w" で開いてヘッダのみ書いて閉じる
     with open(train_loss_path, "w") as f_tr:
         f_tr.write("# epoch train_loss train_data_loss train_pde_loss\n")
     with open(val_loss_path, "w") as f_va:
@@ -511,7 +607,7 @@ def main():
             flush=True,
         )
 
-        # ---- ここで .dat に 1 行ずつ追記 ----
+        # loss を .dat に追記
         with open(train_loss_path, "a") as f_tr:
             f_tr.write(
                 f"{epoch} {train_loss:.8e} {train_data:.8e} {train_pde:.8e}\n"
@@ -523,24 +619,30 @@ def main():
                 f"{epoch} {val_loss:.8e} {val_data:.8e} {val_pde:.8e}\n"
             )
             f_va.flush()
-        # --------------------------------------
 
-    print("Loss history is being recorded in train_loss.dat / val_loss.dat")
+        # scheduler 用に val_loss を監視
+        scheduler.step(val_loss)
+
+    print("Loss history is recorded in train_loss.dat / val_loss.dat")
 
     # ==== 学習済みモデルの保存 ====
     out_path = "pressure_gnn_prototype.pt"
     torch.save(model.state_dict(), out_path)
     print(f"Model saved to {out_path}")
 
-    # ==== (オプション) テストスナップショットで Ax-b と x_true を確認 ====
+    # ==== (1) テストスナップショットで x_true との相対誤差を確認 ====
     if hasattr(graphs[0], "x_true"):
         print("Checking relative error vs OpenFOAM solution (first graph)...")
         data0 = graphs[0].to(device)
         with torch.no_grad():
             x_pred = model(data0)
-            x_true = data0.x_true
-            rel_err = torch.norm(x_pred - x_true) / torch.norm(x_true)
+            x_true = data0.x_true.to(device)
+            rel_err = torch.norm(x_pred - x_true) / (torch.norm(x_true) + 1.0e-20)
             print(f"  ||x_pred - x_true|| / ||x_true|| = {rel_err.item():.3e}")
+
+    # ==== (2) Validation 全体で diagnostics を評価 ====
+    evaluate_diagnostics(model, val_graphs, device)
+
 
 if __name__ == "__main__":
     main()
