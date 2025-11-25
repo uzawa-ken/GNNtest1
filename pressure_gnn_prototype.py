@@ -24,7 +24,7 @@ import torch
 from torch import nn
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, GATConv, SAGEConv, GINConv
 
 # ------------------------------------------------------------
 # 0. 定数とハイパーパラメータ設定
@@ -43,10 +43,11 @@ class TrainingConfig:
     batch_size: int = 1  # グラフのバッチサイズ
 
     # モデル
-    model_type: str = "basic"  # "basic" or "improved"
+    model_type: str = "basic"  # "basic", "improved", "gat", "graphsage", "gin"
     hidden_dim: int = 64
     num_layers: int = 3
-    dropout: float = 0.1  # ImprovedPressureGNN用
+    dropout: float = 0.1  # 高度なモデル用
+    num_heads: int = 4  # GAT用のアテンションヘッド数
 
     # 学習
     num_epochs: int = 200
@@ -92,10 +93,13 @@ def parse_args() -> TrainingConfig:
                         help="Batch size for training")
 
     # モデル
-    parser.add_argument("--model-type", type=str, default="basic", choices=["basic", "improved"],
-                        help="Model architecture: basic (simple GCN) or improved (with residuals)")
+    parser.add_argument("--model-type", type=str, default="basic",
+                        choices=["basic", "improved", "gat", "graphsage", "gin"],
+                        help="Model architecture: basic (GCN), improved (GCN+residual), gat (GAT), graphsage (GraphSAGE), gin (GIN)")
     parser.add_argument("--hidden-dim", type=int, default=64,
                         help="Hidden dimension size")
+    parser.add_argument("--num-heads", type=int, default=4,
+                        help="Number of attention heads for GAT")
     parser.add_argument("--num-layers", type=int, default=3,
                         help="Number of GNN layers")
     parser.add_argument("--dropout", type=float, default=0.1,
@@ -154,6 +158,7 @@ def parse_args() -> TrainingConfig:
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        num_heads=args.num_heads,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         lambda_pde=args.lambda_pde,
@@ -669,9 +674,14 @@ class RealtimePlotter:
         self.val_data_losses = []
         self.train_pde_losses = []
         self.val_pde_losses = []
+        self.train_L_A_losses = []
+        self.val_L_A_losses = []
+        self.train_L_div_losses = []
+        self.val_L_div_losses = []
 
-        # プロットの初期化
-        self.fig, self.axes = self.plt.subplots(1, 3, figsize=(18, 5))
+        # プロットの初期化（5つのサブプロット）
+        self.fig, self.axes = self.plt.subplots(2, 3, figsize=(20, 10))
+        self.axes = self.axes.flatten()  # 2D配列を1D配列に変換
         self.plt.ion()  # インタラクティブモードをON
         self.fig.show()
 
@@ -681,9 +691,13 @@ class RealtimePlotter:
         train_loss: float,
         train_data: float,
         train_pde: float,
+        train_L_A: float,
+        train_L_div: float,
         val_loss: float,
         val_data: float,
         val_pde: float,
+        val_L_A: float,
+        val_L_div: float,
     ):
         """プロットを更新"""
         # データを追加
@@ -694,6 +708,10 @@ class RealtimePlotter:
         self.val_data_losses.append(val_data)
         self.train_pde_losses.append(train_pde)
         self.val_pde_losses.append(val_pde)
+        self.train_L_A_losses.append(train_L_A)
+        self.val_L_A_losses.append(val_L_A)
+        self.train_L_div_losses.append(train_L_div)
+        self.val_L_div_losses.append(val_L_div)
 
         # plot_interval ごとにのみプロットを更新
         if epoch % self.plot_interval != 0:
@@ -732,6 +750,29 @@ class RealtimePlotter:
         self.axes[2].legend(fontsize=10)
         self.axes[2].grid(True, alpha=0.3)
         self.axes[2].set_yscale('log')
+
+        # 4. L_A Loss (Matrix Residual)
+        self.axes[3].plot(self.epochs, self.train_L_A_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
+        self.axes[3].plot(self.epochs, self.val_L_A_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
+        self.axes[3].set_xlabel('Epoch', fontsize=11)
+        self.axes[3].set_ylabel('L_A Loss', fontsize=11)
+        self.axes[3].set_title('L_A (Matrix Residual)', fontsize=12, fontweight='bold')
+        self.axes[3].legend(fontsize=10)
+        self.axes[3].grid(True, alpha=0.3)
+        self.axes[3].set_yscale('log')
+
+        # 5. L_div Loss (Divergence)
+        self.axes[4].plot(self.epochs, self.train_L_div_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
+        self.axes[4].plot(self.epochs, self.val_L_div_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
+        self.axes[4].set_xlabel('Epoch', fontsize=11)
+        self.axes[4].set_ylabel('L_div Loss', fontsize=11)
+        self.axes[4].set_title('L_div (Divergence)', fontsize=12, fontweight='bold')
+        self.axes[4].legend(fontsize=10)
+        self.axes[4].grid(True, alpha=0.3)
+        self.axes[4].set_yscale('log')
+
+        # 最後のサブプロット（axes[5]）は非表示
+        self.axes[5].axis('off')
 
         self.plt.tight_layout()
         self.fig.canvas.draw()
@@ -850,6 +891,225 @@ class ImprovedPressureGNN(nn.Module):
         return x.view(-1)  # [N]
 
 
+class GATPressureGNN(nn.Module):
+    """
+    Graph Attention Networks (GAT) ベースの GNN
+
+    特徴:
+    - Multi-head attention mechanism
+    - 各エッジの重要度を動的に学習
+    - より表現力の高いグラフ畳み込み
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 64,
+        num_layers: int = 3,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+
+        # 入力投影層
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+
+        # GAT層
+        self.convs = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+
+        for _ in range(num_layers):
+            self.convs.append(
+                GATConv(hidden_dim, hidden_dim // num_heads, heads=num_heads, dropout=dropout)
+            )
+            self.layer_norms.append(nn.LayerNorm(hidden_dim))
+
+        # 出力層
+        self.output_proj = nn.Linear(hidden_dim, 1)
+
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, data: Data) -> torch.Tensor:
+        x = data.x
+        edge_index = data.edge_index
+
+        # 入力投影
+        x = self.input_proj(x)
+        x = self.activation(x)
+
+        # GAT層 with residual connections
+        for i in range(self.num_layers):
+            residual = x
+
+            # Graph attention convolution
+            x = self.convs[i](x, edge_index)
+
+            # Layer normalization
+            x = self.layer_norms[i](x)
+
+            # Activation
+            x = self.activation(x)
+
+            # Dropout
+            x = self.dropout(x)
+
+            # Residual connection
+            x = x + residual
+
+        # 出力投影
+        x = self.output_proj(x)
+
+        return x.view(-1)  # [N]
+
+
+class GraphSAGEPressureGNN(nn.Module):
+    """
+    GraphSAGE (Sample and Aggregate) ベースの GNN
+
+    特徴:
+    - 近傍ノードのサンプリングと集約
+    - スケーラビリティに優れる
+    - 大規模グラフでも効率的
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 64,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+
+        # 入力投影層
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+
+        # GraphSAGE層
+        self.convs = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+
+        for _ in range(num_layers):
+            self.convs.append(SAGEConv(hidden_dim, hidden_dim))
+            self.layer_norms.append(nn.LayerNorm(hidden_dim))
+
+        # 出力層
+        self.output_proj = nn.Linear(hidden_dim, 1)
+
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, data: Data) -> torch.Tensor:
+        x = data.x
+        edge_index = data.edge_index
+
+        # 入力投影
+        x = self.input_proj(x)
+        x = self.activation(x)
+
+        # GraphSAGE層 with residual connections
+        for i in range(self.num_layers):
+            residual = x
+
+            # GraphSAGE convolution
+            x = self.convs[i](x, edge_index)
+
+            # Layer normalization
+            x = self.layer_norms[i](x)
+
+            # Activation
+            x = self.activation(x)
+
+            # Dropout
+            x = self.dropout(x)
+
+            # Residual connection
+            x = x + residual
+
+        # 出力投影
+        x = self.output_proj(x)
+
+        return x.view(-1)  # [N]
+
+
+class GINPressureGNN(nn.Module):
+    """
+    Graph Isomorphism Network (GIN) ベースの GNN
+
+    特徴:
+    - WL test と同等の表現力
+    - グラフ構造の識別能力が高い
+    - 理論的に最も強力なGNNの一つ
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 64,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+
+        # 入力投影層
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+
+        # GIN層（各層にMLPが必要）
+        self.convs = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+
+        for _ in range(num_layers):
+            # GINConvには独自のMLPを渡す
+            mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+            )
+            self.convs.append(GINConv(mlp))
+            self.layer_norms.append(nn.LayerNorm(hidden_dim))
+
+        # 出力層
+        self.output_proj = nn.Linear(hidden_dim, 1)
+
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, data: Data) -> torch.Tensor:
+        x = data.x
+        edge_index = data.edge_index
+
+        # 入力投影
+        x = self.input_proj(x)
+        x = self.activation(x)
+
+        # GIN層 with residual connections
+        for i in range(self.num_layers):
+            residual = x
+
+            # GIN convolution
+            x = self.convs[i](x, edge_index)
+
+            # Layer normalization
+            x = self.layer_norms[i](x)
+
+            # Activation
+            x = self.activation(x)
+
+            # Dropout
+            x = self.dropout(x)
+
+            # Residual connection
+            x = x + residual
+
+        # 出力投影
+        x = self.output_proj(x)
+
+        return x.view(-1)  # [N]
+
+
 # ------------------------------------------------------------
 # 4. Ax, 残差 r, L_A, L_div, w_i の計算
 # ------------------------------------------------------------
@@ -880,15 +1140,17 @@ def compute_losses(
     data: Data,
     x_pred: torch.Tensor,
     lambda_pde: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     data   : 1つのグラフ（1つの Poisson システム）
     x_pred : GNN が出力した解ベクトル [N]
 
     戻り値:
-      total_loss, data_loss, pde_loss
+      total_loss, data_loss, pde_loss, L_A, L_div
         - data_loss : (x_pred - x_true)^2 の平均（x_true が無ければ 0）
         - pde_loss  : L_A + L_div
+        - L_A       : 行列表現の PDE 残差
+        - L_div     : 発散項（体積重み付き）
     """
     b = data.b  # [N]
 
@@ -927,7 +1189,7 @@ def compute_losses(
     pde_loss = L_A + L_div
 
     total_loss = data_loss + lambda_pde * pde_loss
-    return total_loss, data_loss.detach(), pde_loss.detach()
+    return total_loss, data_loss.detach(), pde_loss.detach(), L_A.detach(), L_div.detach()
 
 
 # ------------------------------------------------------------
@@ -940,7 +1202,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_pde: float,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float, float]:
     """
     1エポック分の学習を実行
 
@@ -952,12 +1214,14 @@ def train_epoch(
         lambda_pde: PDE損失の重み
 
     Returns:
-        (平均total_loss, 平均data_loss, 平均pde_loss)
+        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div)
     """
     model.train()
     total_loss = 0.0
     total_data = 0.0
     total_pde = 0.0
+    total_L_A = 0.0
+    total_L_div = 0.0
     n = 0
 
     for batch in dataloader:
@@ -965,7 +1229,7 @@ def train_epoch(
         optimizer.zero_grad()
 
         x_pred = model(batch)
-        loss, data_loss, pde_loss = compute_losses(
+        loss, data_loss, pde_loss, L_A, L_div = compute_losses(
             batch, x_pred, lambda_pde=lambda_pde
         )
 
@@ -975,9 +1239,11 @@ def train_epoch(
         total_loss += loss.item()
         total_data += data_loss.item()
         total_pde += pde_loss.item()
+        total_L_A += L_A.item()
+        total_L_div += L_div.item()
         n += 1
 
-    return total_loss / n, total_data / n, total_pde / n
+    return total_loss / n, total_data / n, total_pde / n, total_L_A / n, total_L_div / n
 
 
 @torch.no_grad()
@@ -986,7 +1252,7 @@ def eval_epoch(
     dataloader: DataLoader,
     device: torch.device,
     lambda_pde: float,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, float, float]:
     """
     1エポック分の評価を実行
 
@@ -997,26 +1263,30 @@ def eval_epoch(
         lambda_pde: PDE損失の重み
 
     Returns:
-        (平均total_loss, 平均data_loss, 平均pde_loss)
+        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div)
     """
     model.eval()
     total_loss = 0.0
     total_data = 0.0
     total_pde = 0.0
+    total_L_A = 0.0
+    total_L_div = 0.0
     n = 0
 
     for batch in dataloader:
         batch = batch.to(device)
         x_pred = model(batch)
-        loss, data_loss, pde_loss = compute_losses(
+        loss, data_loss, pde_loss, L_A, L_div = compute_losses(
             batch, x_pred, lambda_pde=lambda_pde
         )
         total_loss += loss.item()
         total_data += data_loss.item()
         total_pde += pde_loss.item()
+        total_L_A += L_A.item()
+        total_L_div += L_div.item()
         n += 1
 
-    return total_loss / n, total_data / n, total_pde / n
+    return total_loss / n, total_data / n, total_pde / n, total_L_A / n, total_L_div / n
 
 
 # ------------------------------------------------------------
@@ -1230,14 +1500,39 @@ def main():
             dropout=config.dropout,
             use_layer_norm=True,
         )
-        print(f"Using ImprovedPressureGNN (with residuals, layer norm, dropout={config.dropout})")
-    else:
+        print(f"Using ImprovedPressureGNN (GCN with residuals, layer norm, dropout={config.dropout})")
+    elif config.model_type == "gat":
+        model = GATPressureGNN(
+            in_dim=in_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            dropout=config.dropout,
+        )
+        print(f"Using GATPressureGNN (Graph Attention Networks, heads={config.num_heads}, dropout={config.dropout})")
+    elif config.model_type == "graphsage":
+        model = GraphSAGEPressureGNN(
+            in_dim=in_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            dropout=config.dropout,
+        )
+        print(f"Using GraphSAGEPressureGNN (GraphSAGE, dropout={config.dropout})")
+    elif config.model_type == "gin":
+        model = GINPressureGNN(
+            in_dim=in_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            dropout=config.dropout,
+        )
+        print(f"Using GINPressureGNN (Graph Isomorphism Network, dropout={config.dropout})")
+    else:  # "basic"
         model = PressureGNN(
             in_dim=in_dim,
             hidden_dim=config.hidden_dim,
             num_layers=config.num_layers
         )
-        print(f"Using basic PressureGNN")
+        print(f"Using basic PressureGNN (simple GCN)")
 
     model.to(device)
 
@@ -1286,10 +1581,10 @@ def main():
     best_val_loss = float('inf')
 
     for epoch in range(1, config.num_epochs + 1):
-        train_loss, train_data, train_pde = train_epoch(
+        train_loss, train_data, train_pde, train_L_A, train_L_div = train_epoch(
             model, train_loader, optimizer, device, config.lambda_pde
         )
-        val_loss, val_data, val_pde = eval_epoch(
+        val_loss, val_data, val_pde, val_L_A, val_L_div = eval_epoch(
             model, val_loader, device, config.lambda_pde
         )
 
@@ -1297,9 +1592,9 @@ def main():
         print(
             f"[Epoch {epoch:03d}] "
             f"train_loss={train_loss:.3e} "
-            f"(data={train_data:.3e}, pde={train_pde:.3e}) "
+            f"(data={train_data:.3e}, pde={train_pde:.3e}, L_A={train_L_A:.3e}, L_div={train_L_div:.3e}) "
             f"val_loss={val_loss:.3e} "
-            f"(data={val_data:.3e}, pde={val_pde:.3e})",
+            f"(data={val_data:.3e}, pde={val_pde:.3e}, L_A={val_L_A:.3e}, L_div={val_L_div:.3e})",
             flush=True,
         )
 
@@ -1318,8 +1613,8 @@ def main():
 
         # リアルタイムプロットの更新
         if plotter is not None:
-            plotter.update(epoch, train_loss, train_data, train_pde,
-                          val_loss, val_data, val_pde)
+            plotter.update(epoch, train_loss, train_data, train_pde, train_L_A, train_L_div,
+                          val_loss, val_data, val_pde, val_L_A, val_L_div)
 
         # TensorBoardへのログ記録
         if writer is not None:
@@ -1329,6 +1624,10 @@ def main():
             writer.add_scalar('Loss/val_data', val_data, epoch)
             writer.add_scalar('Loss/train_pde', train_pde, epoch)
             writer.add_scalar('Loss/val_pde', val_pde, epoch)
+            writer.add_scalar('Loss/train_L_A', train_L_A, epoch)
+            writer.add_scalar('Loss/val_L_A', val_L_A, epoch)
+            writer.add_scalar('Loss/train_L_div', train_L_div, epoch)
+            writer.add_scalar('Loss/val_L_div', val_L_div, epoch)
             writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         # Best モデルの保存（validation loss が改善した場合）

@@ -74,12 +74,28 @@ python pressure_gnn_prototype.py --batch-size 4 --hidden-dim 128
 # 基本的な学習（リアルタイムプロット有効）
 python pressure_gnn_prototype.py --realtime-plot
 
-# 改良版モデルで深いネットワークを学習
+# GAT (Graph Attention Networks) で学習
 python pressure_gnn_prototype.py \
-  --model-type improved \
+  --model-type gat \
   --hidden-dim 128 \
-  --num-layers 5 \
+  --num-layers 4 \
+  --num-heads 8 \
   --dropout 0.2 \
+  --realtime-plot
+
+# GraphSAGE で学習
+python pressure_gnn_prototype.py \
+  --model-type graphsage \
+  --hidden-dim 256 \
+  --num-layers 4 \
+  --dropout 0.1
+
+# GIN (Graph Isomorphism Network) で高精度学習
+python pressure_gnn_prototype.py \
+  --model-type gin \
+  --hidden-dim 256 \
+  --num-layers 6 \
+  --dropout 0.15 \
   --num-epochs 500 \
   --early-stopping-patience 50 \
   --realtime-plot
@@ -115,10 +131,12 @@ python pressure_gnn_prototype.py --realtime-plot
 python pressure_gnn_prototype.py --realtime-plot --plot-interval 5
 ```
 
-**表示される3つのグラフ**：
+**表示される5つのグラフ**：
 1. **Total Loss**: 訓練損失と検証損失の推移
 2. **Data Loss**: データ損失（MSE）の推移
-3. **PDE Loss**: PDE残差損失の推移
+3. **PDE Loss**: PDE残差損失の推移（L_A + L_div）
+4. **L_A Loss**: 行列残差損失の推移
+5. **L_div Loss**: 発散項損失の推移
 
 **注意事項**：
 - GUIバックエンド（TkAgg）が必要です
@@ -272,17 +290,62 @@ $$
 
 ## モデルアーキテクチャ
 
-### PressureGNN (Basic)
-- シンプルなGCNスタック
-- 高速で軽量
-- 小規模問題に最適
+本プロジェクトでは、5種類のGNNアーキテクチャをサポートしています：
 
-### ImprovedPressureGNN (Advanced)
-- Residual (Skip) Connections
-- Layer Normalization
-- Dropout Regularization
-- より深いネットワークに対応
-- 大規模問題や複雑な問題に最適
+### 1. PressureGNN (Basic) - `--model-type basic`
+- **ベースライン**: シンプルなGCNスタック
+- **特徴**: 高速で軽量
+- **適用**: 小規模問題や初期検証に最適
+
+### 2. ImprovedPressureGNN - `--model-type improved`
+- **特徴**:
+  - Residual (Skip) Connections
+  - Layer Normalization
+  - Dropout Regularization
+- **適用**: より深いネットワークに対応、大規模問題や複雑な問題に最適
+
+### 3. GATPressureGNN - `--model-type gat`
+- **Graph Attention Networks (GAT)**
+- **特徴**:
+  - Multi-head attention mechanism
+  - 各エッジの重要度を動的に学習
+  - より表現力の高いグラフ畳み込み
+- **適用**: 不均一なメッシュや複雑な境界条件を持つ問題
+
+### 4. GraphSAGEPressureGNN - `--model-type graphsage`
+- **GraphSAGE (Sample and Aggregate)**
+- **特徴**:
+  - 近傍ノードのサンプリングと集約
+  - スケーラビリティに優れる
+  - 大規模グラフでも効率的
+- **適用**: 大規模メッシュや計算効率を重視する場合
+
+### 5. GINPressureGNN - `--model-type gin`
+- **Graph Isomorphism Network (GIN)**
+- **特徴**:
+  - Weisfeiler-Lehman testと同等の表現力
+  - グラフ構造の識別能力が高い
+  - 理論的に最も強力なGNNの一つ
+- **適用**: 複雑なトポロジーや高精度が要求される問題
+
+### モデル選択のガイドライン
+
+```bash
+# まずはベースラインで動作確認
+python pressure_gnn_prototype.py --model-type basic
+
+# 精度を上げたい場合は improved を試す
+python pressure_gnn_prototype.py --model-type improved --num-layers 5
+
+# 複雑なメッシュにはGATが有効
+python pressure_gnn_prototype.py --model-type gat --num-heads 8 --hidden-dim 128
+
+# 大規模問題にはGraphSAGE
+python pressure_gnn_prototype.py --model-type graphsage --hidden-dim 256
+
+# 最高精度を目指すならGIN
+python pressure_gnn_prototype.py --model-type gin --hidden-dim 256 --num-layers 6
+```
 
 ## トラブルシューティング
 
