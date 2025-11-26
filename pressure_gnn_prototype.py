@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 Prototype: A-graph GNN solver for pressure Poisson
-
-Graph      : coefficient matrix A (from pEqn_*.dat)
-Data loss  : L_data = mean( (x_pred - x_true)^2 )  (if x_true があれば / 無ければ 0)
-PDE loss   : L_pde  = L_A + L_div
-  - L_A   = mean( (A x_pred - b)^2 )
-  - L_div = mean( w_i * ( (A x_pred - b)_i / V_i )^2 )
-      * V_i は pEqn_*.dat のセル体積 (なければ cellSize^3 でフォールバック)
-      * w_i は cellSize, aspectRatio から作る mesh-quality weight
-total loss = L_data + lambda_pde * L_pde
 """
+# Graph      : coefficient matrix A (from pEqn_*.dat)
+# Data loss  : L_data = mean( (x_pred - x_true)^2 )  (if x_true があれば / 無ければ 0)
+# PDE loss   : L_pde  = L_A + L_wall
+#   - L_A      = mean( (A x_pred - b)^2 )
+#   - L_wall   = 壁近傍セルの r_i^2 を mesh-quality weight 付きで強調する項
+#   - L_div    = mean( w_i * ( (A x_pred - b)_i / V_i )^2 )
+#                ※ L_div は診断用に計算するだけで、L_pde には含めない
+# total loss = L_data + lambda_pde * L_pde
+
 
 import os
 import glob
@@ -48,6 +48,13 @@ class TrainingConfig:
     num_layers: int = 3
     dropout: float = 0.1  # 高度なモデル用
     num_heads: int = 4  # GAT用のアテンションヘッド数
+
+    # 数値計算用の小さな値（ゼロ除算防止）
+    EPSILON_VOLUME = 1e-12
+    EPSILON_NORM = 1e-20
+
+    # 壁近傍セルの残差をどれだけ強く見るか（必要に応じて調整）
+    WALL_STRENGTH = 5.0
 
     # 学習
     num_epochs: int = 200
@@ -193,14 +200,17 @@ def set_random_seed(seed: int) -> None:
 def parse_cells_format_a(
     cell_lines: List[str],
     nCells: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     フォーマットA（拡張+体積あり）のセル情報を解析
 
-    フォーマット: id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump
+    フォーマット（v2）:
+        id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump [isWallCell]
+
+    isWallCell は 0/1（省略された場合は 0）
 
     Returns:
-        coords, diag, bvec, volume, cell_size, aspect_ratio
+        coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
     """
     coords = np.zeros((nCells, 3), dtype=np.float64)
     diag = np.zeros(nCells, dtype=np.float64)
@@ -208,6 +218,7 @@ def parse_cells_format_a(
     volume = np.zeros(nCells, dtype=np.float64)
     cell_size = np.zeros(nCells, dtype=np.float64)
     aspect_ratio = np.ones(nCells, dtype=np.float64)
+    is_wall = np.zeros(nCells, dtype=np.float64)
 
     for ln in cell_lines:
         parts = ln.split()
@@ -222,26 +233,34 @@ def parse_cells_format_a(
         volume[cid] = float(parts[10])
         cell_size[cid] = float(parts[11])
 
-    return coords, diag, bvec, volume, cell_size, aspect_ratio
+        # isWallCell（14列目）があれば読み込む（無ければ 0）
+        if len(parts) >= 14:
+            is_wall[cid] = float(parts[13])
+        else:
+            is_wall[cid] = 0.0
+
+    return coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
 
 
 def parse_cells_format_b(
     cell_lines: List[str],
     nCells: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     フォーマットB（拡張、体積なし）のセル情報を解析
 
-    フォーマット: id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
+    フォーマット:
+        id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
 
     Returns:
-        coords, diag, bvec, volume, cell_size, aspect_ratio
+        coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
     """
     coords = np.zeros((nCells, 3), dtype=np.float64)
     diag = np.zeros(nCells, dtype=np.float64)
     bvec = np.zeros(nCells, dtype=np.float64)
     cell_size = np.zeros(nCells, dtype=np.float64)
     aspect_ratio = np.ones(nCells, dtype=np.float64)
+    is_wall = np.zeros(nCells, dtype=np.float64)
 
     for ln in cell_lines:
         parts = ln.split()
@@ -259,7 +278,7 @@ def parse_cells_format_b(
     # 体積は cellSize^3 で近似
     volume = cell_size ** 3
 
-    return coords, diag, bvec, volume, cell_size, aspect_ratio
+    return coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
 
 
 def parse_cells_format_c(
@@ -417,19 +436,20 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
     n_fields = len(first_parts)
 
     if n_fields >= 13:
-        # フォーマット A: 拡張 + 体積あり
-        coords, diag, bvec, volume, cell_size, aspect_ratio = parse_cells_format_a(
+        # フォーマット A: 拡張 + 体積あり (+ isWallCell があれば読む)
+        coords, diag, bvec, volume, cell_size, aspect_ratio, wall_mask = parse_cells_format_a(
             cell_lines, nCells
         )
     elif n_fields == 12:
         # フォーマット B: 拡張（体積なし）
-        coords, diag, bvec, volume, cell_size, aspect_ratio = parse_cells_format_b(
+        coords, diag, bvec, volume, cell_size, aspect_ratio, wall_mask = parse_cells_format_b(
             cell_lines, nCells
         )
     else:
         # フォーマット C: 最小版
         coords, diag, bvec = parse_cells_format_c(cell_lines, nCells)
-        # cellSize/aspectRatio/volumeは後で推定
+        # cellSize/aspectRatio/volume は後で推定
+        wall_mask = np.zeros(nCells, dtype=np.float64)
 
     # --- EDGES 部分の解析 ---
     lower_ids, upper_ids, lower_vals, upper_vals = parse_edges(edge_lines, nFaces)
@@ -485,6 +505,10 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
     data.cell_size = cell_size_t.view(-1)
     data.aspect_ratio = aspect_t.view(-1)
     data.volume = volume_t  # ★ 厳密な V_i（あるいは近似）
+
+    # 壁近傍フラグ（0/1）
+    wall_mask_t = torch.from_numpy(wall_mask).float().view(-1)
+    data.wall_mask = wall_mask_t
 
     # --- (オプション) x_<time>.dat があれば ground-truth として読み込み
     base = os.path.basename(pEqn_path)
@@ -678,7 +702,9 @@ class RealtimePlotter:
         self.val_L_A_losses = []
         self.train_L_div_losses = []
         self.val_L_div_losses = []
-
+        self.train_L_wall_losses = []   # NEW
+        self.val_L_wall_losses = []     # NEW
+        
         # プロットの初期化（5つのサブプロット）
         self.fig, self.axes = self.plt.subplots(2, 3, figsize=(20, 10))
         self.axes = self.axes.flatten()  # 2D配列を1D配列に変換
@@ -693,11 +719,13 @@ class RealtimePlotter:
         train_pde: float,
         train_L_A: float,
         train_L_div: float,
+        train_L_wall: float,
         val_loss: float,
         val_data: float,
         val_pde: float,
         val_L_A: float,
         val_L_div: float,
+        val_L_wall: float,
     ):
         """プロットを更新"""
         # データを追加
@@ -712,6 +740,8 @@ class RealtimePlotter:
         self.val_L_A_losses.append(val_L_A)
         self.train_L_div_losses.append(train_L_div)
         self.val_L_div_losses.append(val_L_div)
+        self.train_L_wall_losses.append(train_L_wall)
+        self.val_L_wall_losses.append(val_L_wall)
 
         # plot_interval ごとにのみプロットを更新
         if epoch % self.plot_interval != 0:
@@ -771,8 +801,15 @@ class RealtimePlotter:
         self.axes[4].grid(True, alpha=0.3)
         self.axes[4].set_yscale('log')
 
-        # 最後のサブプロット（axes[5]）は非表示
-        self.axes[5].axis('off')
+        # 6. L_wall Loss (Wall residual)
+        self.axes[5].plot(self.epochs, self.train_L_wall_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
+        self.axes[5].plot(self.epochs, self.val_L_wall_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
+        self.axes[5].set_xlabel('Epoch', fontsize=11)
+        self.axes[5].set_ylabel('L_wall Loss', fontsize=11)
+        self.axes[5].set_title('L_wall (Wall cells)', fontsize=12, fontweight='bold')
+        self.axes[5].legend(fontsize=10)
+        self.axes[5].grid(True, alpha=0.3)
+        self.axes[5].set_yscale('log')
 
         self.plt.tight_layout()
         self.fig.canvas.draw()
@@ -1140,17 +1177,18 @@ def compute_losses(
     data: Data,
     x_pred: torch.Tensor,
     lambda_pde: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     data   : 1つのグラフ（1つの Poisson システム）
     x_pred : GNN が出力した解ベクトル [N]
 
     戻り値:
-      total_loss, data_loss, pde_loss, L_A, L_div
+      total_loss, data_loss, pde_loss, L_A, L_div, L_wall
         - data_loss : (x_pred - x_true)^2 の平均（x_true が無ければ 0）
-        - pde_loss  : L_A + L_div
+        - pde_loss  : L_A + L_wall  （学習用の PDE loss）
         - L_A       : 行列表現の PDE 残差
-        - L_div     : 発散項（体積重み付き）
+        - L_div     : 発散項（診断用、学習には使わない）
+        - L_wall    : 壁近傍セルの残差（WALL_STRENGTH でスケール済み）
     """
     b = data.b  # [N]
 
@@ -1167,16 +1205,13 @@ def compute_losses(
     else:
         data_loss = torch.tensor(0.0, device=x_pred.device)
 
-    # --- PDE loss: L_A + L_div
+    # === PDE loss の内訳 ===
 
-    # L_A: 行列表現の PDE 残差
+    # (1) L_A: 行列表現の PDE 残差
     L_A = torch.mean(r ** 2)
 
-    # L_div: div ≒ r / V （Thompson 系の「フラックス発散」的な項）
-    volume = data.volume  # ★ 厳密な V_i（ない場合は読み込み時に cellSize^3 で近似）
-    div_hat = r / (volume + EPSILON_VOLUME)
-
-    # w_i: cellSize と aspectRatio から作る mesh-quality weight
+    # (2) メッシュ品質重み w_i
+    volume = data.volume
     cell_size = data.cell_size
     aspect = data.aspect_ratio
 
@@ -1184,12 +1219,39 @@ def compute_losses(
     ar_norm = aspect / (aspect.mean() + EPSILON_VOLUME)
     w = 0.5 * (cs_norm + ar_norm)
 
+    # (3) L_div: div ≒ r / V （診断用のみ）
+    div_hat = r / (volume + EPSILON_VOLUME)
     L_div = torch.mean(w * (div_hat ** 2))
 
-    pde_loss = L_A + L_div
+    # (4) L_wall: 壁近傍セルだけを強く見る残差
+    if hasattr(data, "wall_mask"):
+        wall_mask = data.wall_mask.to(x_pred.device)
+    else:
+        wall_mask = torch.zeros_like(r)
+
+    # 0/1 マスクを想定
+    weighted_r2_wall = wall_mask * w * (r ** 2)
+    denom = wall_mask.sum()
+    if denom > 0:
+        L_wall_raw = weighted_r2_wall.sum() / denom
+    else:
+        L_wall_raw = torch.tensor(0.0, device=x_pred.device)
+
+    L_wall = WALL_STRENGTH * L_wall_raw
+
+    # (5) 学習で使う PDE loss
+    pde_loss = L_A + L_wall
 
     total_loss = data_loss + lambda_pde * pde_loss
-    return total_loss, data_loss.detach(), pde_loss.detach(), L_A.detach(), L_div.detach()
+
+    return (
+        total_loss,
+        data_loss.detach(),
+        pde_loss.detach(),
+        L_A.detach(),
+        L_div.detach(),   # 診断用
+        L_wall.detach(),  # 壁ペナルティ
+    )
 
 
 # ------------------------------------------------------------
@@ -1202,19 +1264,12 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_pde: float,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float]:
     """
     1エポック分の学習を実行
 
-    Args:
-        model: GNNモデル
-        dataloader: データローダー（バッチ処理）
-        optimizer: オプティマイザ
-        device: デバイス（CPU/GPU）
-        lambda_pde: PDE損失の重み
-
     Returns:
-        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div)
+        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div, 平均L_wall)
     """
     model.train()
     total_loss = 0.0
@@ -1222,6 +1277,7 @@ def train_epoch(
     total_pde = 0.0
     total_L_A = 0.0
     total_L_div = 0.0
+    total_L_wall = 0.0
     n = 0
 
     for batch in dataloader:
@@ -1229,7 +1285,7 @@ def train_epoch(
         optimizer.zero_grad()
 
         x_pred = model(batch)
-        loss, data_loss, pde_loss, L_A, L_div = compute_losses(
+        loss, data_loss, pde_loss, L_A, L_div, L_wall = compute_losses(
             batch, x_pred, lambda_pde=lambda_pde
         )
 
@@ -1241,9 +1297,17 @@ def train_epoch(
         total_pde += pde_loss.item()
         total_L_A += L_A.item()
         total_L_div += L_div.item()
+        total_L_wall += L_wall.item()
         n += 1
 
-    return total_loss / n, total_data / n, total_pde / n, total_L_A / n, total_L_div / n
+    return (
+        total_loss / n,
+        total_data / n,
+        total_pde / n,
+        total_L_A / n,
+        total_L_div / n,
+        total_L_wall / n,
+    )
 
 
 @torch.no_grad()
@@ -1252,18 +1316,12 @@ def eval_epoch(
     dataloader: DataLoader,
     device: torch.device,
     lambda_pde: float,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float]:
     """
     1エポック分の評価を実行
 
-    Args:
-        model: GNNモデル
-        dataloader: データローダー（バッチ処理）
-        device: デバイス（CPU/GPU）
-        lambda_pde: PDE損失の重み
-
     Returns:
-        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div)
+        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div, 平均L_wall)
     """
     model.eval()
     total_loss = 0.0
@@ -1271,12 +1329,13 @@ def eval_epoch(
     total_pde = 0.0
     total_L_A = 0.0
     total_L_div = 0.0
+    total_L_wall = 0.0
     n = 0
 
     for batch in dataloader:
         batch = batch.to(device)
         x_pred = model(batch)
-        loss, data_loss, pde_loss, L_A, L_div = compute_losses(
+        loss, data_loss, pde_loss, L_A, L_div, L_wall = compute_losses(
             batch, x_pred, lambda_pde=lambda_pde
         )
         total_loss += loss.item()
@@ -1284,9 +1343,17 @@ def eval_epoch(
         total_pde += pde_loss.item()
         total_L_A += L_A.item()
         total_L_div += L_div.item()
+        total_L_wall += L_wall.item()
         n += 1
 
-    return total_loss / n, total_data / n, total_pde / n, total_L_A / n, total_L_div / n
+    return (
+        total_loss / n,
+        total_data / n,
+        total_pde / n,
+        total_L_A / n,
+        total_L_div / n,
+        total_L_wall / n,
+    )
 
 
 # ------------------------------------------------------------
@@ -1581,10 +1648,10 @@ def main():
     best_val_loss = float('inf')
 
     for epoch in range(1, config.num_epochs + 1):
-        train_loss, train_data, train_pde, train_L_A, train_L_div = train_epoch(
+        train_loss, train_data, train_pde, train_L_A, train_L_div, train_L_wall = train_epoch(
             model, train_loader, optimizer, device, config.lambda_pde
         )
-        val_loss, val_data, val_pde, val_L_A, val_L_div = eval_epoch(
+        val_loss, val_data, val_pde, val_L_A, val_L_div, val_L_wall = eval_epoch(
             model, val_loader, device, config.lambda_pde
         )
 
@@ -1592,9 +1659,9 @@ def main():
         print(
             f"[Epoch {epoch:03d}] "
             f"train_loss={train_loss:.3e} "
-            f"(data={train_data:.3e}, pde={train_pde:.3e}, L_A={train_L_A:.3e}, L_div={train_L_div:.3e}) "
+            f"(data={train_data:.3e}, pde={train_pde:.3e}, L_A={train_L_A:.3e}, L_div={train_L_div:.3e}, L_wall={train_L_wall:.3e}) "
             f"val_loss={val_loss:.3e} "
-            f"(data={val_data:.3e}, pde={val_pde:.3e}, L_A={val_L_A:.3e}, L_div={val_L_div:.3e})",
+            f"(data={val_data:.3e}, pde={val_pde:.3e}, L_A={val_L_A:.3e}, L_div={val_L_div:.3e}, L_wall={val_L_wall:.3e})",
             flush=True,
         )
 
@@ -1613,8 +1680,11 @@ def main():
 
         # リアルタイムプロットの更新
         if plotter is not None:
-            plotter.update(epoch, train_loss, train_data, train_pde, train_L_A, train_L_div,
-                          val_loss, val_data, val_pde, val_L_A, val_L_div)
+            plotter.update(
+                epoch,
+                train_loss, train_data, train_pde, train_L_A, train_L_div, train_L_wall,
+                val_loss, val_data, val_pde, val_L_A, val_L_div, val_L_wall
+            )
 
         # TensorBoardへのログ記録
         if writer is not None:
@@ -1628,6 +1698,8 @@ def main():
             writer.add_scalar('Loss/val_L_A', val_L_A, epoch)
             writer.add_scalar('Loss/train_L_div', train_L_div, epoch)
             writer.add_scalar('Loss/val_L_div', val_L_div, epoch)
+            writer.add_scalar('Loss/train_L_wall', train_L_wall, epoch)   # NEW
+            writer.add_scalar('Loss/val_L_wall', val_L_wall, epoch)       # NEW
             writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         # Best モデルの保存（validation loss が改善した場合）
