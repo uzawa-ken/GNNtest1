@@ -34,6 +34,9 @@ from torch_geometric.nn import GCNConv, GATConv, SAGEConv, GINConv
 EPSILON_VOLUME = 1e-12
 EPSILON_NORM = 1e-20
 
+# 壁近傍セルの残差をどれだけ強く見るか（必要に応じて調整）
+WALL_STRENGTH = 5.0
+
 
 @dataclass
 class TrainingConfig:
@@ -48,13 +51,6 @@ class TrainingConfig:
     num_layers: int = 3
     dropout: float = 0.1  # 高度なモデル用
     num_heads: int = 4  # GAT用のアテンションヘッド数
-
-    # 数値計算用の小さな値（ゼロ除算防止）
-    EPSILON_VOLUME = 1e-12
-    EPSILON_NORM = 1e-20
-
-    # 壁近傍セルの残差をどれだけ強く見るか（必要に応じて調整）
-    WALL_STRENGTH = 5.0
 
     # 学習
     num_epochs: int = 200
@@ -412,20 +408,30 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
     assert lines[1].startswith("nFaces"), f"Invalid format: {pEqn_path}"
     nFaces = int(lines[1].split()[1])
 
-    # CELLSとEDGESセクションの位置を特定
+    # CELLS、EDGES、WALL_FACESセクションの位置を特定
     cells_start = None
     edges_start = None
+    wall_faces_start = None
     for i, ln in enumerate(lines):
         if ln.startswith("CELLS"):
             cells_start = i
         elif ln.startswith("EDGES"):
             edges_start = i
+        elif ln.startswith("WALL_FACES"):
+            wall_faces_start = i
 
     if cells_start is None or edges_start is None:
         raise RuntimeError(f"CELLS/EDGES セクションが見つかりません: {pEqn_path}")
 
     cell_lines = lines[cells_start + 1 : edges_start]
-    edge_lines = lines[edges_start + 1 :]
+
+    # WALL_FACESセクションがある場合はそこまで、ない場合は最後まで
+    if wall_faces_start is not None:
+        edge_lines = lines[edges_start + 1 : wall_faces_start]
+        wall_face_lines = lines[wall_faces_start + 1 :]
+    else:
+        edge_lines = lines[edges_start + 1 :]
+        wall_face_lines = []
 
     if len(cell_lines) != nCells:
         print(f"[WARN] nCells={nCells} だが CELLS 行数={len(cell_lines)}: {pEqn_path}")
@@ -465,6 +471,21 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
         cell_size, aspect_ratio, volume = estimate_cell_properties(
             coords, neighbors, nCells
         )
+
+    # --- WALL_FACES セクションの解析 ---
+    # WALL_FACESセクションから壁近傍セルを特定してwall_maskを更新
+    if wall_face_lines:
+        for ln in wall_face_lines:
+            parts = ln.split()
+            if len(parts) >= 1:
+                # フォーマット想定: セルID（壁に隣接するセル）
+                try:
+                    cell_id = int(parts[0])
+                    if 0 <= cell_id < nCells:
+                        wall_mask[cell_id] = 1.0
+                except ValueError:
+                    # パースできない行はスキップ
+                    continue
 
     # --- GNN用 edge_index (無向グラフ) ---
     ei_src = np.concatenate([lower_ids, upper_ids])
