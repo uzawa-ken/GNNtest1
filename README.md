@@ -8,10 +8,19 @@ Physics-Informed Graph Neural Network (GNN) for solving pressure Poisson equatio
 
 ### 主な特徴
 
-- **物理法則に基づいた学習**: PDE残差とメッシュ品質を考慮した損失関数
-- **2つのGNNアーキテクチャ**:
-  - `PressureGNN`: シンプルなGCNベース
-  - `ImprovedPressureGNN`: Residual connections、Layer Normalization、Dropout付き
+- **壁面境界条件を重視した物理法則学習**:
+  - PDE残差（L_A）と壁近傍セル残差（L_wall）を組み合わせた損失関数
+  - メッシュ品質を考慮した重み付き損失
+  - 発散項（L_div）は診断用として計算・可視化
+- **5種類の強力なGNNアーキテクチャ**:
+  - `PressureGNN` (basic): シンプルなGCNベース
+  - `ImprovedPressureGNN` (improved): Residual connections + Layer Normalization
+  - `GATPressureGNN` (gat): Graph Attention Networks (multi-head attention)
+  - `GraphSAGEPressureGNN` (graphsage): スケーラブルなSample & Aggregate
+  - `GINPressureGNN` (gin): 最高の表現力を持つGraph Isomorphism Network
+- **リアルタイム可視化**:
+  - matplotlibで6つの損失グラフをリアルタイム表示
+  - TensorBoardサポートで詳細なメトリクス追跡
 - **柔軟な設定**: コマンドライン引数で全てのハイパーパラメータを調整可能
 - **Early Stopping**: 過学習を自動検出
 - **チェックポイント機能**: ベストモデルの自動保存と学習再開
@@ -24,7 +33,7 @@ Physics-Informed Graph Neural Network (GNN) for solving pressure Poisson equatio
 ### 必要なライブラリ
 
 ```bash
-pip install torch torch-geometric numpy matplotlib pytest
+pip install torch torch-geometric numpy matplotlib pytest tensorboard
 ```
 
 または、PyTorch Geometricの詳細なインストール方法については[公式ドキュメント](https://pytorch-geometric.readthedocs.io/)を参照してください。
@@ -42,6 +51,9 @@ python pressure_gnn_prototype.py --model-type improved --num-epochs 300
 
 # バッチ処理を有効化
 python pressure_gnn_prototype.py --batch-size 4 --hidden-dim 128
+
+# リアルタイムプロット有効化
+python pressure_gnn_prototype.py --realtime-plot
 ```
 
 ### 主要なコマンドライン引数
@@ -51,10 +63,11 @@ python pressure_gnn_prototype.py --batch-size 4 --hidden-dim 128
 - `--batch-size`: バッチサイズ (デフォルト: 1)
 
 #### モデル設定
-- `--model-type`: モデルタイプ (`basic` or `improved`, デフォルト: `basic`)
+- `--model-type`: モデルタイプ (`basic`, `improved`, `gat`, `graphsage`, `gin`, デフォルト: `basic`)
 - `--hidden-dim`: 隠れ層の次元数 (デフォルト: 64)
 - `--num-layers`: GNN層の数 (デフォルト: 3)
-- `--dropout`: ドロップアウト率 (improved モデル用, デフォルト: 0.1)
+- `--dropout`: ドロップアウト率 (デフォルト: 0.1)
+- `--num-heads`: GAT用のアテンションヘッド数 (デフォルト: 4)
 
 #### 学習設定
 - `--num-epochs`: エポック数 (デフォルト: 200)
@@ -67,6 +80,9 @@ python pressure_gnn_prototype.py --batch-size 4 --hidden-dim 128
 #### その他
 - `--seed`: ランダムシード (デフォルト: 42)
 - `--checkpoint-dir`: チェックポイント保存ディレクトリ (デフォルト: `./checkpoints`)
+- `--realtime-plot`: リアルタイム可視化を有効化
+- `--plot-interval`: プロット更新間隔（エポック数、デフォルト: 1）
+- `--use-tensorboard`: TensorBoardロギングを有効化
 
 ### 使用例
 
@@ -131,12 +147,13 @@ python pressure_gnn_prototype.py --realtime-plot
 python pressure_gnn_prototype.py --realtime-plot --plot-interval 5
 ```
 
-**表示される5つのグラフ**：
+**表示される6つのグラフ**：
 1. **Total Loss**: 訓練損失と検証損失の推移
 2. **Data Loss**: データ損失（MSE）の推移
-3. **PDE Loss**: PDE残差損失の推移（L_A + L_div）
+3. **PDE Loss**: PDE残差損失の推移（L_A + L_wall）
 4. **L_A Loss**: 行列残差損失の推移
-5. **L_div Loss**: 発散項損失の推移
+5. **L_div Loss**: 発散項損失の推移（診断用）
+6. **L_wall Loss**: 壁近傍セル残差損失の推移
 
 **注意事項**：
 - GUIバックエンド（TkAgg）が必要です
@@ -227,18 +244,27 @@ GNNtest1/
 nCells 1000
 nFaces 2500
 CELLS
-id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump
-0 0.0 0.0 0.0 1.5 0.3 0.1 0.05 1.2 0.9 0.001 0.1 0.05
+id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump [isWallCell]
+0 0.0 0.0 0.0 1.5 0.3 0.1 0.05 1.2 0.9 0.001 0.1 0.05 0
 ...
 EDGES
 faceId lowerCell upperCell lowerCoeff upperCoeff
 0 0 1 -0.5 -0.5
 ...
+WALL_FACES
+cellId
+10
+25
+...
 ```
+
+**注**:
+- `isWallCell` (14列目) は省略可能（省略時は0とみなす）
+- `WALL_FACES` セクションは省略可能（壁近傍セルのリスト）
 
 #### フォーマットB（拡張、体積なし）
 ```
-id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
+id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump [isWallCell]
 ```
 体積は `cellSize^3` で近似されます。
 
@@ -247,6 +273,19 @@ id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
 id x y z diag b
 ```
 `cellSize` と `aspectRatio` は近傍セルから自動推定されます。
+
+### WALL_FACESセクションについて
+
+`WALL_FACES` セクションには、壁面に隣接するセルのIDをリストします。このセクションは省略可能ですが、含めることで以下の効果があります：
+
+- **L_wall損失**: これらのセルの残差を重点的に学習（デフォルトで5倍に重み付け）
+- **境界条件の精度向上**: 壁面での物理的制約を強化
+- **収束の高速化**: 境界条件が重要な問題で学習が安定
+
+```python
+# コード内でWALL_STRENGTH定数で重みを調整可能（デフォルト: 5.0）
+WALL_STRENGTH = 5.0  # 壁近傍セルの残差を5倍に重み付け
+```
 
 ### 出力: prediction_*.dat
 
@@ -260,33 +299,63 @@ id x y z diag b
 
 ## 損失関数
 
+### 総損失
+
 $$
 \mathcal{L}_{\text{total}} = \mathcal{L}_{\text{data}} + \lambda_{\text{pde}} \mathcal{L}_{\text{PDE}}
 $$
 
-### データ損失
+### データ損失（教師あり学習）
+
 $$
 \mathcal{L}_{\text{data}} = \frac{1}{N} \sum_{i=1}^{N} (x_{\text{pred},i} - x_{\text{true},i})^2
 $$
 
-### PDE損失
+`x_true` がない場合は $\mathcal{L}_{\text{data}} = 0$ となり、純粋な物理制約による学習となります。
+
+### PDE損失（物理制約）
+
+**重要**: PDE損失は **L_A + L_wall** の2項で構成されます。L_divは診断用のみで学習には使用しません。
+
 $$
-\mathcal{L}_{\text{PDE}} = \mathcal{L}_A + \mathcal{L}_{\text{div}}
+\mathcal{L}_{\text{PDE}} = \mathcal{L}_A + \mathcal{L}_{\text{wall}}
 $$
+
+#### L_A: 行列残差損失
 
 $$
 \mathcal{L}_A = \frac{1}{N} \sum_{i=1}^{N} (Ax_{\text{pred}} - b)_i^2
 $$
 
+全セルでの行列方程式 $Ax = b$ の残差を評価します。
+
+#### L_wall: 壁近傍セル損失
+
+$$
+\mathcal{L}_{\text{wall}} = \alpha_{\text{wall}} \cdot \frac{1}{N_{\text{wall}}} \sum_{i \in \text{wall}} w_i \cdot (Ax_{\text{pred}} - b)_i^2
+$$
+
+ここで：
+- $\alpha_{\text{wall}}$: `WALL_STRENGTH` 定数（デフォルト: 5.0）
+- $N_{\text{wall}}$: 壁近傍セルの数
+- $w_i$: メッシュ品質重み
+
+#### L_div: 発散項（診断用のみ）
+
 $$
 \mathcal{L}_{\text{div}} = \frac{1}{N} \sum_{i=1}^{N} w_i \left( \frac{(Ax_{\text{pred}} - b)_i}{V_i} \right)^2
 $$
 
-ここで：
-- $A$: 係数行列
+**注**: L_divは学習には使用されず、診断・可視化のためだけに計算されます。
+
+### パラメータ説明
+
+- $A$: 係数行列（OpenFOAMのlduMatrix）
 - $b$: 右辺ベクトル
-- $V_i$: セルの体積
-- $w_i$: メッシュ品質重み（cellSizeとaspectRatioから計算）
+- $x_{\text{pred}}$: GNNの予測解
+- $V_i$: セルiの体積
+- $w_i$: メッシュ品質重み = $0.5 \times (\text{cellSize}_{\text{norm}} + \text{aspectRatio}_{\text{norm}})$
+- $\lambda_{\text{pde}}$: PDE損失の重み（デフォルト: 1.0）
 
 ## モデルアーキテクチャ
 
@@ -355,6 +424,12 @@ RuntimeError: pEqn_*.dat が見つかりません
 ```
 → `--data-dir` オプションでデータディレクトリを正しく指定してください。
 
+### WALL_FACESセクションのパースエラー
+```
+RuntimeError: EDGES 行のフォーマットが想定と違います: WALL_FACES
+```
+→ 最新版にアップデートしてください。古いバージョンではWALL_FACESセクションに対応していません。
+
 ### メモリ不足
 ```
 RuntimeError: CUDA out of memory
@@ -363,8 +438,13 @@ RuntimeError: CUDA out of memory
 
 ### 学習が収束しない
 - `--lr` を小さくしてみてください（例: 0.0001）
-- `--lambda-pde` を調整してください
-- `--model-type improved` を試してください
+- `--lambda-pde` を調整してください（例: 2.0）
+- より強力なモデルを試してください（`--model-type improved` や `--model-type gat`）
+- 壁面境界が重要な問題では、WALL_FACESセクションを含めると収束が改善します
+
+### リアルタイムプロットが表示されない
+- GUIバックエンド（TkAgg）がインストールされているか確認してください
+- SSH環境の場合は `--use-tensorboard` を使用してください
 
 ## パフォーマンスチューニング
 
@@ -386,13 +466,50 @@ python pressure_gnn_prototype.py --hidden-dim 256 --num-layers 6
 python pressure_gnn_prototype.py --hidden-dim 32 --num-layers 2
 ```
 
+### WALL_STRENGTH定数の調整
+
+壁面境界条件の重要度を調整したい場合、コード内の定数を変更してください：
+
+```python
+# pressure_gnn_prototype.py の冒頭（38行目）
+WALL_STRENGTH = 5.0  # デフォルト値
+
+# より強く壁面を重視する場合
+WALL_STRENGTH = 10.0
+
+# 壁面の影響を弱める場合
+WALL_STRENGTH = 2.0
+```
+
+## 技術的な詳細
+
+### 物理制約の設計思想
+
+1. **L_A（行列残差）**: 全体的なPDE制約を満たす
+2. **L_wall（壁面残差）**: 境界条件を重点的に学習（CFDで極めて重要）
+3. **L_div（発散項）**: 診断用として計算・可視化するが学習には使用しない
+   - 理由: L_Aとの相関が高く、重複した制約となるため
+   - 用途: メッシュ品質の影響を診断する際に有用
+
+この設計により、境界条件の精度を保ちながら、過度に制約された問題を避けています。
+
+### メッシュ品質重み
+
+```python
+w_i = 0.5 * (cellSize_norm + aspectRatio_norm)
+```
+
+- セルサイズと形状の両方を考慮
+- 品質の悪いセル（小さい、歪んでいる）での誤差を重視
+- 数値的安定性の向上に寄与
+
 ## 引用
 
 このコードを研究で使用する場合は、以下のように引用してください：
 
 ```bibtex
 @software{pressure_gnn_solver,
-  title = {Pressure Poisson GNN Solver},
+  title = {Pressure Poisson GNN Solver with Wall Boundary Emphasis},
   author = {Your Name},
   year = {2025},
   url = {https://github.com/yourusername/GNNtest1}
@@ -401,16 +518,14 @@ python pressure_gnn_prototype.py --hidden-dim 32 --num-layers 2
 
 ## ライセンス
 
-このプロジェクトはMITライセンスの下で公開されています。
+MIT License
 
 ## 貢献
 
-Issue や Pull Request を歓迎します！
+プルリクエストを歓迎します。大きな変更の場合は、まずissueを開いて変更内容を議論してください。
 
-## 今後の改善予定
+## 参考文献
 
-- [ ] GAT (Graph Attention Networks) のサポート
-- [ ] より高度な物理制約の追加
-- [ ] マルチGPU対応
-- [ ] ONNX形式でのモデルエクスポート
-- [ ] リアルタイム推論モード
+- [PyTorch Geometric Documentation](https://pytorch-geometric.readthedocs.io/)
+- [OpenFOAM User Guide](https://www.openfoam.com/documentation/user-guide)
+- Physics-Informed Neural Networks (PINNs) literature
