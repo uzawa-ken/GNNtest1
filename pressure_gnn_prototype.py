@@ -5,11 +5,11 @@ Prototype: A-graph GNN solver for pressure Poisson
 """
 # Graph      : coefficient matrix A (from pEqn_*.dat)
 # Data loss  : L_data = mean( (x_pred - x_true)^2 )  (if x_true があれば / 無ければ 0)
-# PDE loss   : L_pde  = L_A + L_wall
-#   - L_A      = mean( (A x_pred - b)^2 )
-#   - L_wall   = 壁近傍セルの r_i^2 を mesh-quality weight 付きで強調する項
-#   - L_div    = mean( w_i * ( (A x_pred - b)_i / V_i )^2 )
-#                ※ L_div は診断用に計算するだけで、L_pde には含めない
+# PDE loss   : L_pde  = mean_i( w_i * r_i^2 )
+#   - r_i      = (A x_pred - b)_i
+#   - w_i      = 1 + q_i
+#               q_i ∈ [0,1] は AR, nonOrth, sizeJump, Co を用いた
+#               5–95% パーセンタイルベースの badness スコア
 # total loss = L_data + lambda_pde * L_pde
 
 
@@ -33,9 +33,6 @@ from torch_geometric.nn import GCNConv, GATConv, SAGEConv, GINConv
 # 数値計算用の小さな値（ゼロ除算防止）
 EPSILON_VOLUME = 1e-12
 EPSILON_NORM = 1e-20
-
-# 壁近傍セルの残差をどれだけ強く見るか（必要に応じて調整）
-WALL_STRENGTH = 5.0
 
 
 @dataclass
@@ -193,20 +190,23 @@ def set_random_seed(seed: int) -> None:
 # 1. ファイル読み込み & グラフ構築
 # ------------------------------------------------------------
 
+# === CHANGED: メッシュ品質指標 (skew, nonOrth, sizeJump, Co) を返すよう拡張 ===
 def parse_cells_format_a(
     cell_lines: List[str],
     nCells: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+           np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     フォーマットA（拡張+体積あり）のセル情報を解析
 
-    フォーマット（v2）:
-        id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump [isWallCell]
+    想定フォーマット（最新版）:
+        id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump [isWallCell] [Co]
 
-    isWallCell は 0/1（省略された場合は 0）
+    ここでは壁フラグは使用せず、メッシュ品質指標のみを取得する。
 
     Returns:
-        coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
+        coords, diag, bvec, volume, cell_size, aspect_ratio,
+        skew, non_ortho, size_jump, Co
     """
     coords = np.zeros((nCells, 3), dtype=np.float64)
     diag = np.zeros(nCells, dtype=np.float64)
@@ -214,7 +214,10 @@ def parse_cells_format_a(
     volume = np.zeros(nCells, dtype=np.float64)
     cell_size = np.zeros(nCells, dtype=np.float64)
     aspect_ratio = np.ones(nCells, dtype=np.float64)
-    is_wall = np.zeros(nCells, dtype=np.float64)
+    skew = np.zeros(nCells, dtype=np.float64)
+    non_ortho = np.zeros(nCells, dtype=np.float64)
+    size_jump = np.zeros(nCells, dtype=np.float64)
+    Co = np.zeros(nCells, dtype=np.float64)
 
     for ln in cell_lines:
         parts = ln.split()
@@ -225,23 +228,29 @@ def parse_cells_format_a(
         coords[cid] = [float(parts[1]), float(parts[2]), float(parts[3])]
         diag[cid] = float(parts[4])
         bvec[cid] = float(parts[5])
+        skew[cid] = float(parts[6])
+        non_ortho[cid] = float(parts[7])
         aspect_ratio[cid] = float(parts[8])
+        # parts[9] は diagContrast（ここでは未使用）
         volume[cid] = float(parts[10])
         cell_size[cid] = float(parts[11])
+        size_jump[cid] = float(parts[12])
 
-        # isWallCell（14列目）があれば読み込む（無ければ 0）
-        if len(parts) >= 14:
-            is_wall[cid] = float(parts[13])
-        else:
-            is_wall[cid] = 0.0
+        # 最後の列またはその一つ前を Co として解釈（isWallCell はここでは使わない）
+        if len(parts) >= 15:
+            Co[cid] = float(parts[14])
+        elif len(parts) >= 14:
+            Co[cid] = float(parts[13])
 
-    return coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
+    return coords, diag, bvec, volume, cell_size, aspect_ratio, skew, non_ortho, size_jump, Co
 
 
+# === CHANGED: フォーマットB も同様にメッシュ品質指標を返す ===
 def parse_cells_format_b(
     cell_lines: List[str],
     nCells: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+           np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     フォーマットB（拡張、体積なし）のセル情報を解析
 
@@ -249,14 +258,18 @@ def parse_cells_format_b(
         id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
 
     Returns:
-        coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
+        coords, diag, bvec, volume, cell_size, aspect_ratio,
+        skew, non_ortho, size_jump, Co
     """
     coords = np.zeros((nCells, 3), dtype=np.float64)
     diag = np.zeros(nCells, dtype=np.float64)
     bvec = np.zeros(nCells, dtype=np.float64)
     cell_size = np.zeros(nCells, dtype=np.float64)
     aspect_ratio = np.ones(nCells, dtype=np.float64)
-    is_wall = np.zeros(nCells, dtype=np.float64)
+    skew = np.zeros(nCells, dtype=np.float64)
+    non_ortho = np.zeros(nCells, dtype=np.float64)
+    size_jump = np.zeros(nCells, dtype=np.float64)
+    Co = np.zeros(nCells, dtype=np.float64)
 
     for ln in cell_lines:
         parts = ln.split()
@@ -267,14 +280,17 @@ def parse_cells_format_b(
         coords[cid] = [float(parts[1]), float(parts[2]), float(parts[3])]
         diag[cid] = float(parts[4])
         bvec[cid] = float(parts[5])
+        skew[cid] = float(parts[6])
+        non_ortho[cid] = float(parts[7])
         aspect_ratio[cid] = float(parts[8])
         h_i = float(parts[10])  # cellSize
         cell_size[cid] = h_i
+        size_jump[cid] = float(parts[11])
 
     # 体積は cellSize^3 で近似
     volume = cell_size ** 3
 
-    return coords, diag, bvec, volume, cell_size, aspect_ratio, is_wall
+    return coords, diag, bvec, volume, cell_size, aspect_ratio, skew, non_ortho, size_jump, Co
 
 
 def parse_cells_format_c(
@@ -386,8 +402,8 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
 
     想定フォーマット（新しい順）:
 
-    [A] 拡張 + 体積あり  (len(parts) == 13)
-        id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump
+    [A] 拡張 + 体積あり  (len(parts) >= 13)
+        id x y z diag b skew nonOrtho aspect diagContrast V cellSize sizeJump [isWallCell] [Co]
 
     [B] 拡張 (体積なし) (len(parts) == 12)
         id x y z diag b skew nonOrtho aspect diagContrast cellSize sizeJump
@@ -437,25 +453,27 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
         print(f"[WARN] nCells={nCells} だが CELLS 行数={len(cell_lines)}: {pEqn_path}")
 
     # --- CELLS 部分の解析 ---
-    # 先頭行からフォーマットを判定
     first_parts = cell_lines[0].split()
     n_fields = len(first_parts)
 
     if n_fields >= 13:
-        # フォーマット A: 拡張 + 体積あり (+ isWallCell があれば読む)
-        coords, diag, bvec, volume, cell_size, aspect_ratio, wall_mask = parse_cells_format_a(
+        coords, diag, bvec, volume, cell_size, aspect_ratio, skew, non_ortho, size_jump, Co = parse_cells_format_a(
             cell_lines, nCells
         )
     elif n_fields == 12:
-        # フォーマット B: 拡張（体積なし）
-        coords, diag, bvec, volume, cell_size, aspect_ratio, wall_mask = parse_cells_format_b(
+        coords, diag, bvec, volume, cell_size, aspect_ratio, skew, non_ortho, size_jump, Co = parse_cells_format_b(
             cell_lines, nCells
         )
     else:
         # フォーマット C: 最小版
         coords, diag, bvec = parse_cells_format_c(cell_lines, nCells)
-        # cellSize/aspectRatio/volume は後で推定
-        wall_mask = np.zeros(nCells, dtype=np.float64)
+        volume = None
+        cell_size = None
+        aspect_ratio = None
+        skew = np.zeros(nCells, dtype=np.float64)
+        non_ortho = np.zeros(nCells, dtype=np.float64)
+        size_jump = np.zeros(nCells, dtype=np.float64)
+        Co = np.zeros(nCells, dtype=np.float64)
 
     # --- EDGES 部分の解析 ---
     lower_ids, upper_ids, lower_vals, upper_vals = parse_edges(edge_lines, nFaces)
@@ -472,20 +490,7 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
             coords, neighbors, nCells
         )
 
-    # --- WALL_FACES セクションの解析 ---
-    # WALL_FACESセクションから壁近傍セルを特定してwall_maskを更新
-    if wall_face_lines:
-        for ln in wall_face_lines:
-            parts = ln.split()
-            if len(parts) >= 1:
-                # フォーマット想定: セルID（壁に隣接するセル）
-                try:
-                    cell_id = int(parts[0])
-                    if 0 <= cell_id < nCells:
-                        wall_mask[cell_id] = 1.0
-                except ValueError:
-                    # パースできない行はスキップ
-                    continue
+    # WALL_FACES セクションは現在は使用しない（必要ならここで wall_mask を構築）
 
     # --- GNN用 edge_index (無向グラフ) ---
     ei_src = np.concatenate([lower_ids, upper_ids])
@@ -512,6 +517,11 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
     upper_val_t = torch.from_numpy(upper_vals).float()
     volume_t = torch.from_numpy(volume).float().view(-1)
 
+    skew_t = torch.from_numpy(skew).float().view(-1)
+    non_ortho_t = torch.from_numpy(non_ortho).float().view(-1)
+    size_jump_t = torch.from_numpy(size_jump).float().view(-1)
+    Co_t = torch.from_numpy(Co).float().view(-1)
+
     data = Data(
         x=x_feat,
         edge_index=edge_index,
@@ -527,9 +537,11 @@ def load_pEqn_graph(pEqn_path: str) -> Data:
     data.aspect_ratio = aspect_t.view(-1)
     data.volume = volume_t  # ★ 厳密な V_i（あるいは近似）
 
-    # 壁近傍フラグ（0/1）
-    wall_mask_t = torch.from_numpy(wall_mask).float().view(-1)
-    data.wall_mask = wall_mask_t
+    # === NEW: メッシュ品質指標を Data に格納 ===
+    data.skew = skew_t
+    data.nonOrth = non_ortho_t
+    data.sizeJump = size_jump_t
+    data.Co = Co_t
 
     # --- (オプション) x_<time>.dat があれば ground-truth として読み込み
     base = os.path.basename(pEqn_path)
@@ -721,14 +733,10 @@ class RealtimePlotter:
         self.val_pde_losses = []
         self.train_L_A_losses = []
         self.val_L_A_losses = []
-        self.train_L_div_losses = []
-        self.val_L_div_losses = []
-        self.train_L_wall_losses = []   # NEW
-        self.val_L_wall_losses = []     # NEW
-        
-        # プロットの初期化（5つのサブプロット）
-        self.fig, self.axes = self.plt.subplots(2, 3, figsize=(20, 10))
-        self.axes = self.axes.flatten()  # 2D配列を1D配列に変換
+
+        # プロットの初期化（4つのサブプロット）
+        self.fig, self.axes = self.plt.subplots(2, 2, figsize=(16, 8))
+        self.axes = self.axes.flatten()
         self.plt.ion()  # インタラクティブモードをON
         self.fig.show()
 
@@ -739,14 +747,10 @@ class RealtimePlotter:
         train_data: float,
         train_pde: float,
         train_L_A: float,
-        train_L_div: float,
-        train_L_wall: float,
         val_loss: float,
         val_data: float,
         val_pde: float,
         val_L_A: float,
-        val_L_div: float,
-        val_L_wall: float,
     ):
         """プロットを更新"""
         # データを追加
@@ -759,10 +763,6 @@ class RealtimePlotter:
         self.val_pde_losses.append(val_pde)
         self.train_L_A_losses.append(train_L_A)
         self.val_L_A_losses.append(val_L_A)
-        self.train_L_div_losses.append(train_L_div)
-        self.val_L_div_losses.append(val_L_div)
-        self.train_L_wall_losses.append(train_L_wall)
-        self.val_L_wall_losses.append(val_L_wall)
 
         # plot_interval ごとにのみプロットを更新
         if epoch % self.plot_interval != 0:
@@ -811,26 +811,6 @@ class RealtimePlotter:
         self.axes[3].legend(fontsize=10)
         self.axes[3].grid(True, alpha=0.3)
         self.axes[3].set_yscale('log')
-
-        # 5. L_div Loss (Divergence)
-        self.axes[4].plot(self.epochs, self.train_L_div_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
-        self.axes[4].plot(self.epochs, self.val_L_div_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
-        self.axes[4].set_xlabel('Epoch', fontsize=11)
-        self.axes[4].set_ylabel('L_div Loss', fontsize=11)
-        self.axes[4].set_title('L_div (Divergence)', fontsize=12, fontweight='bold')
-        self.axes[4].legend(fontsize=10)
-        self.axes[4].grid(True, alpha=0.3)
-        self.axes[4].set_yscale('log')
-
-        # 6. L_wall Loss (Wall residual)
-        self.axes[5].plot(self.epochs, self.train_L_wall_losses, 'b-', label='Train', linewidth=2, alpha=0.8)
-        self.axes[5].plot(self.epochs, self.val_L_wall_losses, 'r-', label='Val', linewidth=2, alpha=0.8)
-        self.axes[5].set_xlabel('Epoch', fontsize=11)
-        self.axes[5].set_ylabel('L_wall Loss', fontsize=11)
-        self.axes[5].set_title('L_wall (Wall cells)', fontsize=12, fontweight='bold')
-        self.axes[5].legend(fontsize=10)
-        self.axes[5].grid(True, alpha=0.3)
-        self.axes[5].set_yscale('log')
 
         self.plt.tight_layout()
         self.fig.canvas.draw()
@@ -1169,7 +1149,7 @@ class GINPressureGNN(nn.Module):
 
 
 # ------------------------------------------------------------
-# 4. Ax, 残差 r, L_A, L_div, w_i の計算
+# 4. Ax, 残差 r, PDE損失
 # ------------------------------------------------------------
 
 def apply_A_to_x(data: Data, x_vec: torch.Tensor) -> torch.Tensor:
@@ -1194,22 +1174,78 @@ def apply_A_to_x(data: Data, x_vec: torch.Tensor) -> torch.Tensor:
     return Ax
 
 
+# === NEW: 5–95% パーセンタイルに基づく badness スコア ===
+def percentile_clipped_badness_high_is_bad(
+    x: torch.Tensor,
+    p_good: float = 0.05,
+    p_bad: float = 0.95,
+) -> torch.Tensor:
+    """
+    大きいほど「悪い」指標 x に対して、[0,1] の badness を返す。
+      - 下側 p_good パーセンタイル以下 → 0
+      - 上側 p_bad パーセンタイル以上 → 1
+      - その間を線形補間
+    """
+    x_flat = x.view(-1)
+    q_low = torch.quantile(x_flat, p_good)
+    q_high = torch.quantile(x_flat, p_bad)
+    if torch.isclose(q_high, q_low):
+        return torch.zeros_like(x)
+    q = (x - q_low) / (q_high - q_low)
+    return torch.clamp(q, 0.0, 1.0)
+
+
+# === NEW: メッシュ品質重み w_i の計算 ===
+def compute_mesh_quality_weight(
+    data: Data,
+    lambda_geom: float = 1.0,
+) -> torch.Tensor:
+    """
+    AR, nonOrth, sizeJump, Co からメッシュ品質重み w_i を計算する。
+
+    - 各指標ごとに 5–95% パーセンタイルで badness ∈ [0,1] を定義
+    - 平均 badness q_i を求め、w_i = 1 + lambda_geom * q_i
+    - PDE loss のスケール安定化のため mean(w) = 1 となるように正規化
+    """
+    metrics = []
+
+    # AR (aspect_ratio) : 常に存在する前提
+    ar = data.aspect_ratio
+    metrics.append(percentile_clipped_badness_high_is_bad(ar))
+
+    if hasattr(data, "nonOrth"):
+        metrics.append(percentile_clipped_badness_high_is_bad(data.nonOrth))
+    if hasattr(data, "sizeJump"):
+        metrics.append(percentile_clipped_badness_high_is_bad(data.sizeJump))
+    if hasattr(data, "Co"):
+        metrics.append(percentile_clipped_badness_high_is_bad(data.Co))
+
+    if len(metrics) == 0:
+        w = torch.ones_like(data.diag)
+    else:
+        q_total = torch.stack(metrics, dim=0).mean(dim=0)
+        w = 1.0 + lambda_geom * q_total  # λ=1 を前提
+
+    # 平均が 1 になるように正規化（全体スケールは lambda_pde に吸収される）
+    w = w / (w.mean() + 1e-8)
+    return w
+
+
 def compute_losses(
     data: Data,
     x_pred: torch.Tensor,
     lambda_pde: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     data   : 1つのグラフ（1つの Poisson システム）
     x_pred : GNN が出力した解ベクトル [N]
 
     戻り値:
-      total_loss, data_loss, pde_loss, L_A, L_div, L_wall
+      total_loss, data_loss, pde_loss, L_A
         - data_loss : (x_pred - x_true)^2 の平均（x_true が無ければ 0）
-        - pde_loss  : L_A + L_wall  （学習用の PDE loss）
-        - L_A       : 行列表現の PDE 残差
-        - L_div     : 発散項（診断用、学習には使わない）
-        - L_wall    : 壁近傍セルの残差（WALL_STRENGTH でスケール済み）
+        - pde_loss  : 5–95% パーセンタイルに基づくメッシュ品質重み w_i を用いた
+                      PDE 残差の加重平均 mean_i( w_i * r_i^2 )
+        - L_A       : 非加重の PDE 残差 mean_i( r_i^2 )（モニタ用）
     """
     b = data.b  # [N]
 
@@ -1226,42 +1262,14 @@ def compute_losses(
     else:
         data_loss = torch.tensor(0.0, device=x_pred.device)
 
-    # === PDE loss の内訳 ===
-
-    # (1) L_A: 行列表現の PDE 残差
+    # (1) L_A: 非加重の行列表現 PDE 残差
     L_A = torch.mean(r ** 2)
 
-    # (2) メッシュ品質重み w_i
-    volume = data.volume
-    cell_size = data.cell_size
-    aspect = data.aspect_ratio
+    # (2) メッシュ品質重み w_i（AR, nonOrth, sizeJump, Co を使用）
+    w_geom = compute_mesh_quality_weight(data, lambda_geom=1.0)
 
-    cs_norm = cell_size / (cell_size.mean() + EPSILON_VOLUME)
-    ar_norm = aspect / (aspect.mean() + EPSILON_VOLUME)
-    w = 0.5 * (cs_norm + ar_norm)
-
-    # (3) L_div: div ≒ r / V （診断用のみ）
-    div_hat = r / (volume + EPSILON_VOLUME)
-    L_div = torch.mean(w * (div_hat ** 2))
-
-    # (4) L_wall: 壁近傍セルだけを強く見る残差
-    if hasattr(data, "wall_mask"):
-        wall_mask = data.wall_mask.to(x_pred.device)
-    else:
-        wall_mask = torch.zeros_like(r)
-
-    # 0/1 マスクを想定
-    weighted_r2_wall = wall_mask * w * (r ** 2)
-    denom = wall_mask.sum()
-    if denom > 0:
-        L_wall_raw = weighted_r2_wall.sum() / denom
-    else:
-        L_wall_raw = torch.tensor(0.0, device=x_pred.device)
-
-    L_wall = WALL_STRENGTH * L_wall_raw
-
-    # (5) 学習で使う PDE loss
-    pde_loss = L_A + L_wall
+    # (3) PDE loss（加重残差）
+    pde_loss = torch.mean(w_geom * (r ** 2))
 
     total_loss = data_loss + lambda_pde * pde_loss
 
@@ -1270,8 +1278,6 @@ def compute_losses(
         data_loss.detach(),
         pde_loss.detach(),
         L_A.detach(),
-        L_div.detach(),   # 診断用
-        L_wall.detach(),  # 壁ペナルティ
     )
 
 
@@ -1285,20 +1291,18 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_pde: float,
-) -> Tuple[float, float, float, float, float, float]:
+) -> Tuple[float, float, float, float]:
     """
     1エポック分の学習を実行
 
     Returns:
-        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div, 平均L_wall)
+        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A)
     """
     model.train()
     total_loss = 0.0
     total_data = 0.0
     total_pde = 0.0
     total_L_A = 0.0
-    total_L_div = 0.0
-    total_L_wall = 0.0
     n = 0
 
     for batch in dataloader:
@@ -1306,7 +1310,7 @@ def train_epoch(
         optimizer.zero_grad()
 
         x_pred = model(batch)
-        loss, data_loss, pde_loss, L_A, L_div, L_wall = compute_losses(
+        loss, data_loss, pde_loss, L_A = compute_losses(
             batch, x_pred, lambda_pde=lambda_pde
         )
 
@@ -1317,8 +1321,6 @@ def train_epoch(
         total_data += data_loss.item()
         total_pde += pde_loss.item()
         total_L_A += L_A.item()
-        total_L_div += L_div.item()
-        total_L_wall += L_wall.item()
         n += 1
 
     return (
@@ -1326,8 +1328,6 @@ def train_epoch(
         total_data / n,
         total_pde / n,
         total_L_A / n,
-        total_L_div / n,
-        total_L_wall / n,
     )
 
 
@@ -1337,34 +1337,30 @@ def eval_epoch(
     dataloader: DataLoader,
     device: torch.device,
     lambda_pde: float,
-) -> Tuple[float, float, float, float, float, float]:
+) -> Tuple[float, float, float, float]:
     """
     1エポック分の評価を実行
 
     Returns:
-        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A, 平均L_div, 平均L_wall)
+        (平均total_loss, 平均data_loss, 平均pde_loss, 平均L_A)
     """
     model.eval()
     total_loss = 0.0
     total_data = 0.0
     total_pde = 0.0
     total_L_A = 0.0
-    total_L_div = 0.0
-    total_L_wall = 0.0
     n = 0
 
     for batch in dataloader:
         batch = batch.to(device)
         x_pred = model(batch)
-        loss, data_loss, pde_loss, L_A, L_div, L_wall = compute_losses(
+        loss, data_loss, pde_loss, L_A = compute_losses(
             batch, x_pred, lambda_pde=lambda_pde
         )
         total_loss += loss.item()
         total_data += data_loss.item()
         total_pde += pde_loss.item()
         total_L_A += L_A.item()
-        total_L_div += L_div.item()
-        total_L_wall += L_wall.item()
         n += 1
 
     return (
@@ -1372,8 +1368,6 @@ def eval_epoch(
         total_data / n,
         total_pde / n,
         total_L_A / n,
-        total_L_div / n,
-        total_L_wall / n,
     )
 
 
@@ -1549,7 +1543,7 @@ def main():
     # いったん全部メモリに読み込む（スナップショット数は多くない前提）
     graphs = [dataset[i] for i in range(len(dataset))]
 
-    # ---- ★ train/val 用にランダムシャッフルして 80/20 分割 ----
+    # ---- train/val 用にランダムシャッフルして 80/20 分割 ----
     n_total = len(graphs)
     idx = np.arange(n_total)
     rng = np.random.default_rng(seed=config.seed)  # 再現性のため固定シード
@@ -1669,10 +1663,10 @@ def main():
     best_val_loss = float('inf')
 
     for epoch in range(1, config.num_epochs + 1):
-        train_loss, train_data, train_pde, train_L_A, train_L_div, train_L_wall = train_epoch(
+        train_loss, train_data, train_pde, train_L_A = train_epoch(
             model, train_loader, optimizer, device, config.lambda_pde
         )
-        val_loss, val_data, val_pde, val_L_A, val_L_div, val_L_wall = eval_epoch(
+        val_loss, val_data, val_pde, val_L_A = eval_epoch(
             model, val_loader, device, config.lambda_pde
         )
 
@@ -1680,9 +1674,9 @@ def main():
         print(
             f"[Epoch {epoch:03d}] "
             f"train_loss={train_loss:.3e} "
-            f"(data={train_data:.3e}, pde={train_pde:.3e}, L_A={train_L_A:.3e}, L_div={train_L_div:.3e}, L_wall={train_L_wall:.3e}) "
+            f"(data={train_data:.3e}, pde={train_pde:.3e}, L_A={train_L_A:.3e}) "
             f"val_loss={val_loss:.3e} "
-            f"(data={val_data:.3e}, pde={val_pde:.3e}, L_A={val_L_A:.3e}, L_div={val_L_div:.3e}, L_wall={val_L_wall:.3e})",
+            f"(data={val_data:.3e}, pde={val_pde:.3e}, L_A={val_L_A:.3e})",
             flush=True,
         )
 
@@ -1703,8 +1697,8 @@ def main():
         if plotter is not None:
             plotter.update(
                 epoch,
-                train_loss, train_data, train_pde, train_L_A, train_L_div, train_L_wall,
-                val_loss, val_data, val_pde, val_L_A, val_L_div, val_L_wall
+                train_loss, train_data, train_pde, train_L_A,
+                val_loss, val_data, val_pde, val_L_A,
             )
 
         # TensorBoardへのログ記録
@@ -1717,10 +1711,6 @@ def main():
             writer.add_scalar('Loss/val_pde', val_pde, epoch)
             writer.add_scalar('Loss/train_L_A', train_L_A, epoch)
             writer.add_scalar('Loss/val_L_A', val_L_A, epoch)
-            writer.add_scalar('Loss/train_L_div', train_L_div, epoch)
-            writer.add_scalar('Loss/val_L_div', val_L_div, epoch)
-            writer.add_scalar('Loss/train_L_wall', train_L_wall, epoch)   # NEW
-            writer.add_scalar('Loss/val_L_wall', val_L_wall, epoch)       # NEW
             writer.add_scalar('Learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
         # Best モデルの保存（validation loss が改善した場合）
